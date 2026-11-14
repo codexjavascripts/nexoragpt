@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#111311" />
+  <meta name="description" content="GROQGPT — Think at the speed of Groq." />
+  <title>GROQGPT — Think at the speed of Groq</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand-row">
+        <a class="brand" href="#" data-route="chat" aria-label="GROQGPT home">
+          <span class="brand-mark"><svg viewBox="0 0 36 36" aria-hidden="true"><path d="M18 3.5 31 11v14L18 32.5 5 25V11L18 3.5Z"/><path d="M13 13h10v10H13z"/><path d="m13 18 5 5 5-5"/></svg></span>
+          <span class="brand-word">GROQ<span>GPT</span></span>
+        </a>
+        <button class="icon-btn sidebar-toggle" id="sidebarToggle" title="Collapse sidebar" aria-label="Collapse sidebar"></button>
+      </div>
+
+      <button class="new-chat-btn" id="newChat"><span class="plus">+</span><span>New chat</span><kbd>⌘ K</kbd></button>
+      <div class="side-search"><span class="search-icon"></span><input id="chatSearch" type="search" placeholder="Search chats" aria-label="Search chats"><kbd>⌘ /</kbd></div>
+      <nav class="primary-nav" aria-label="Main navigation">
+        <button class="nav-item active" data-route="chat"><span class="nav-ico ico-chat"></span><span>Chat</span></button>
+        <button class="nav-item" data-route="images"><span class="nav-ico ico-image"></span><span>Images</span><span class="nav-pill">NEW</span></button>
+        <button class="nav-item" data-route="explore"><span class="nav-ico ico-compass"></span><span>Explore</span></button>
+        <button class="nav-item" data-route="plugins"><span class="nav-ico ico-puzzle"></span><span>Plugins</span></button>
+        <button class="nav-item" data-route="projects"><span class="nav-ico ico-project"></span><span>Projects</span></button>
+        <button class="nav-item" data-route="library"><span class="nav-ico ico-library"></span><span>File library</span></button>
+        <button class="nav-item" data-route="tasks"><span class="nav-ico ico-task"></span><span>Scheduled tasks</span></button>
+        <button class="nav-item" data-route="calendar"><span class="nav-ico ico-calendar"></span><span>Calendar</span></button>
+      </nav>
+      <div class="history-head"><span>YOUR CHATS</span><button class="text-icon-btn" id="historyMore" aria-label="Chat options">···</button></div>
+      <div class="chat-list" id="chatList"></div>
+      <div class="sidebar-bottom">
+        <button class="nav-item" data-route="settings"><span class="nav-ico ico-settings"></span><span>Settings</span></button>
+        <button class="profile-card" id="profileButton"><span class="avatar">G</span><span class="profile-copy"><b>Guest account</b><small>Free plan</small></span><span class="profile-dots">···</span></button>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <div class="mobile-brand"><button class="icon-btn mobile-menu" id="mobileMenu" aria-label="Open menu"></button><span class="brand-word">GROQ<span>GPT</span></span></div>
+        <div class="crumb" id="pageCrumb"><span class="crumb-dot"></span> Groq Playground</div>
+        <div class="top-actions"><button class="icon-btn theme-toggle" id="themeToggle" title="Toggle theme" aria-label="Toggle theme"></button><button class="upgrade-btn" id="upgradeButton"><span class="sparkle">✳</span> Upgrade plan <span class="arrow">↗</span></button></div>
+      </header>
+      <section class="view" id="view"></section>
+    </main>
+    <div class="mobile-scrim" id="mobileScrim"></div>
+    <div id="toast" class="toast" role="status"></div>
+    <input type="file" id="filePicker" hidden multiple accept=".pdf,.docx,.txt,.csv" />
+    <input type="file" id="libraryPicker" hidden multiple accept=".pdf,.docx,.txt,.csv,.png,.jpg,.jpeg,.webp,.gif" />
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
