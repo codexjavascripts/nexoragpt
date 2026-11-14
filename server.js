@@ -1,709 +1,723 @@
-import http from 'node:http';
-import fs from 'node:fs';
-import path from 'node:path';
+import express from 'express';
+import { createClient } from '@supabase/supabase-js';
+import { rateLimit } from 'express-rate-limit';
+import helmet from 'helmet';
+import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import crypto from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
 
-const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const PUBLIC = path.join(ROOT, 'public');
-const DATA = path.resolve(ROOT, process.env.DATA_DIR || 'data');
-const UPLOADS = path.join(DATA, 'uploads');
-const IMAGES = path.join(DATA, 'images');
-for (const dir of [DATA, UPLOADS, IMAGES]) fs.mkdirSync(dir, { recursive: true });
+const ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)));
+const MODEL = 'openai/gpt-oss-120b';
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GUEST_DAYS = 30;
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
-const PORT = Number(process.env.PORT || 3000);
-const ORIGIN = process.env.APP_ORIGIN || `http://localhost:${PORT}`;
-const SECRET = process.env.SESSION_SECRET || 'development-only-change-me-before-deploying';
-const HORDE_KEY = process.env.AI_HORDE_API_KEY || '0000000000';
-const HORDE_CHAT = (process.env.AI_HORDE_CHAT_URL || 'https://oai.aihorde.net/v1').replace(/\/$/, '');
-const HORDE_API = (process.env.AI_HORDE_API_URL || 'https://aihorde.net/api').replace(/\/$/, '');
-const CHAT_URL = (process.env.AI_CHAT_BASE_URL || HORDE_CHAT).replace(/\/$/, '');
-const CHAT_KEY = process.env.AI_CHAT_API_KEY || HORDE_KEY;
-const CHAT_IS_HORDE = CHAT_URL === HORDE_CHAT;
-const CLIENT_AGENT = `NEXORAGPT:1.0.0:${process.env.AI_HORDE_CLIENT_CONTACT || 'self-hosted'}`;
-const db = new DatabaseSync(path.join(DATA, 'nexoragpt.sqlite'));
-db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    username TEXT NOT NULL, password_hash TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0,
-    settings TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS pending (
-    email TEXT PRIMARY KEY COLLATE NOCASE, username TEXT NOT NULL, password_hash TEXT NOT NULL,
-    code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, last_sent INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS resets (
-    email TEXT PRIMARY KEY COLLATE NOCASE, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL,
-    last_sent INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS pending_email (
-    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    email TEXT NOT NULL UNIQUE COLLATE NOCASE, code_hash TEXT NOT NULL,
-    expires_at INTEGER NOT NULL, last_sent INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS sessions (
-    token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS chats (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-    role TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS files (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL, name TEXT NOT NULL,
-    mime TEXT NOT NULL, disk_path TEXT NOT NULL, extracted_text TEXT NOT NULL DEFAULT '',
-    created_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS images (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    horde_id TEXT NOT NULL, prompt TEXT NOT NULL, style TEXT NOT NULL DEFAULT 'none', width INTEGER NOT NULL, height INTEGER NOT NULL,
-    status TEXT NOT NULL, disk_path TEXT NOT NULL DEFAULT '', mime TEXT NOT NULL DEFAULT '',
-    wait_time INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS plugin_prefs (
-    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, plugin_id TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, plugin_id)
-  );
-  CREATE TABLE IF NOT EXISTS rate_limits (
-    bucket TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL
-  );
-`);
-if (!db.prepare('PRAGMA table_info(images)').all().some(column => column.name === 'style')) {
-  db.exec("ALTER TABLE images ADD COLUMN style TEXT NOT NULL DEFAULT 'none'");
-}
+try {
+  const env = await readFile(resolve(ROOT, '.env'), 'utf8');
+  for (const line of env.split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (!match || match[1] in process.env) continue;
+    process.env[match[1]] = match[2].replace(/^(["'])(.*)\1$/, '$2');
+  }
+} catch {}
 
-const now = () => Date.now();
-const uuid = () => crypto.randomUUID();
-const sha = value => crypto.createHash('sha256').update(value).digest('hex');
-const json = (res, status, value, headers = {}) => {
-  const body = JSON.stringify(value);
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
-  res.end(body);
-};
-const fail = (status, message, extra = {}) => Object.assign(new Error(message), { status, extra });
-const safeEqual = (a, b) => {
-  const left = Buffer.isBuffer(a) ? a : Buffer.from(String(a)); const right = Buffer.isBuffer(b) ? b : Buffer.from(String(b));
-  return left.length === right.length && crypto.timingSafeEqual(left, right);
-};
-const randomCode = () => String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
-const hashPassword = async password => {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const key = await new Promise((resolve, reject) => crypto.scrypt(password, salt, 64, (err, value) => err ? reject(err) : resolve(value)));
-  return `${salt}:${Buffer.from(key).toString('hex')}`;
-};
-const checkPassword = async (password, stored) => {
-  const [salt, hex] = String(stored).split(':');
-  if (!salt || !hex) return false;
-  const key = await new Promise((resolve, reject) => crypto.scrypt(password, salt, 64, (err, value) => err ? reject(err) : resolve(value)));
-  return safeEqual(Buffer.from(hex, 'hex'), key);
-};
-const cleanModelText = text => String(text || '')
-  .replace(/<\|(?:think|thinking|analysis|reasoning)[^|]*\|>[\s\S]*?<\|\/(?:think|thinking|analysis|reasoning)\|>/gi, '')
-  .replace(/<(?:think|thinking|analysis|reasoning)>[\s\S]*?<\/(?:think|thinking|analysis|reasoning)>/gi, '')
-  .replace(/<\|(?:im_start|im_end|endoftext|fim_suffix|gh[a-z_]+)\|>/gi, '')
-  .replace(/<\/?(?:think|thinking|analysis|reasoning)>/gi, '')
-  .replace(/\[(?:INST|\/INST)\]|<\/?s>/gi, '')
-  .replace(/^\s*(?:assistant|final)\s*:\s*/i, '')
-  .trim();
-const hashCode = (email, code) => crypto.createHmac('sha256', SECRET).update(`${email.toLowerCase()}:${code}`).digest('hex');
+const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'groqgpt-private';
 
+const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SECRET_KEY
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } })
+  : null;
+
+const app = express();
+app.disable('x-powered-by');
+if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
+app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+app.use(express.json({ limit: '15mb' }));
+app.use((req, res, next) => {
+  const origin = req.get('origin');
+  if (origin) {
+    try { if (new URL(origin).host !== req.get('host')) return res.status(403).json({ error: 'Cross-origin request blocked.' }); }
+    catch { return res.status(403).json({ error: 'Cross-origin request blocked.' }); }
+  }
+  next();
+});
+app.use('/api', rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'draft-8', legacyHeaders: false }));
+const aiLimiter = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Please wait a moment before sending another request.' } });
+const loginLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 12, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Try again in 15 minutes.' } });
+const guestLimiter = rateLimit({ windowMs: 60 * 60_000, limit: 20, standardHeaders: 'draft-8', legacyHeaders: false, skip: req => Boolean(cookieValue(req, cookieName)), message: { error: 'Guest workspaces are being created too quickly from this connection. Try again later.' } });
+
+const cookieName = 'groqgpt_session';
+const sessionMs = 30 * 24 * 60 * 60 * 1000;
+const cookieSecure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+const defaultWorkspace = () => ({ chats: [], projects: [], assistants: [], folders: [], memory: [], settings: { memoryEnabled: true }, images: [] });
+const isConfigured = () => Boolean(supabase && process.env.GROQ_API_KEY);
+
+function sha(value) { return createHash('sha256').update(value).digest('hex'); }
 function cookieValue(req, name) {
-  const raw = req.headers.cookie || '';
-  for (const part of raw.split(';')) {
-    const [key, ...rest] = part.trim().split('=');
-    if (key === name) return decodeURIComponent(rest.join('='));
-  }
-  return '';
+  const row = (req.headers.cookie || '').split(';').map(v => v.trim()).find(v => v.startsWith(`${name}=`));
+  return row ? decodeURIComponent(row.slice(name.length + 1)) : '';
+}
+function setSessionCookie(res, token) { res.setHeader('Set-Cookie', `${cookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(sessionMs / 1000)}${cookieSecure}`); }
+function clearSessionCookie(res) { res.setHeader('Set-Cookie', `${cookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${cookieSecure}`); }
+function passwordHash(password) {
+  const salt = randomBytes(16).toString('hex');
+  return `${salt}:${scryptSync(password, salt, 64).toString('hex')}`;
+}
+function verifyPassword(password, encoded) {
+  if (typeof encoded !== 'string' || !encoded.includes(':')) return false;
+  const [salt, hash] = encoded.split(':');
+  const actual = scryptSync(password, salt, 64);
+  const expected = Buffer.from(hash, 'hex');
+  return expected.length === actual.length && timingSafeEqual(actual, expected);
+}
+function cleanName(name) { return String(name || 'Untitled').replace(/[\u0000-\u001f]/g, '').trim().slice(0, 120) || 'Untitled'; }
+function publicUser(user) { return { id: user.id, email: user.email || null, displayName: user.display_name || 'Guest', isGuest: Boolean(user.is_guest), role: user.role || 'user' }; }
+function sendError(res, status, message) { return res.status(status).json({ error: message }); }
+
+async function createSession(res, { userId = null, isAdmin = false } = {}) {
+  const token = randomBytes(32).toString('base64url');
+  const expires = new Date(Date.now() + sessionMs).toISOString();
+  const { error } = await supabase.from('app_sessions').insert({ token_hash: sha(token), user_id: userId, is_admin: isAdmin, expires_at: expires });
+  if (error) throw error;
+  setSessionCookie(res, token);
+  return token;
 }
 
-function enforceRate(req, bucket, max, windowMs) {
-  const key = `${bucket}:${req.socket.remoteAddress || 'unknown'}`;
-  const row = db.prepare('SELECT window_start, count FROM rate_limits WHERE bucket=?').get(key);
-  const stamp = now();
-  if (!row || stamp - row.window_start >= windowMs) {
-    db.prepare('INSERT INTO rate_limits(bucket,window_start,count) VALUES(?,?,1) ON CONFLICT(bucket) DO UPDATE SET window_start=excluded.window_start,count=1').run(key, stamp);
-    return;
-  }
-  if (row.count >= max) throw fail(429, 'Too many attempts. Please wait a little and try again.');
-  db.prepare('UPDATE rate_limits SET count=count+1 WHERE bucket=?').run(key);
-}
-
-async function readBody(req, limit = 12 * 1024 * 1024) {
-  const chunks = []; let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > limit) throw fail(413, 'That upload is too large. The limit is 12 MB.');
-    chunks.push(chunk);
-  }
-  const raw = Buffer.concat(chunks).toString('utf8');
-  try { return raw ? JSON.parse(raw) : {}; } catch { throw fail(400, 'Request must contain valid JSON.'); }
-}
-
-async function sendVerification(email, code, reset = false) {
-  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS || !process.env.SMTP_FROM) {
-    throw fail(503, 'Email delivery is not configured. Add SMTP settings to the .env file before registering.');
-  }
-  let nodemailer;
-  try { nodemailer = (await import('nodemailer')).default; }
-  catch { throw fail(503, 'Mail delivery package is missing. Run npm install in the project folder.'); }
-  const port = Number(process.env.SMTP_PORT || 587);
-  const transport = nodemailer.createTransport({
-    host: process.env.SMTP_HOST, port, secure: String(process.env.SMTP_SECURE).toLowerCase() === 'true' || port === 465,
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    connectionTimeout: 12000, greetingTimeout: 12000, socketTimeout: 20000,
-  });
-  const heading = reset ? 'Reset your NEXORAGPT password' : 'Verify your NEXORAGPT email';
-  const purpose = reset ? 'password reset' : 'email verification';
-  await transport.sendMail({
-    from: process.env.SMTP_FROM, to: email, subject: heading,
-    text: `Your NEXORAGPT ${purpose} code is ${code}. It expires in 10 minutes. If you did not request this, you can ignore this email.`,
-    html: `<div style="font:16px Arial,sans-serif;color:#272335;max-width:520px"><h1>${heading}</h1><p>Your six-digit code is:</p><p style="font-size:32px;letter-spacing:8px;font-weight:bold">${code}</p><p>This code expires in 10 minutes. If you did not request this, you can ignore this email.</p></div>`,
-  });
-}
-
-function getSession(req) {
-  const token = cookieValue(req, 'nexora_session');
-  if (!token || token.length > 200) return null;
-  const row = db.prepare(`SELECT users.id, users.email, users.username, users.settings, sessions.token_hash
-    FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>? AND users.verified=1`).get(sha(token), now());
-  if (!row) return null;
-  return { id: row.id, email: row.email, username: row.username, settings: JSON.parse(row.settings || '{}'), tokenHash: row.token_hash };
-}
-
-function setSession(res, token) {
-  const secure = ORIGIN.startsWith('https://') ? '; Secure' : '';
-  res.setHeader('Set-Cookie', `nexora_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000${secure}`);
-}
-
-function checkOrigin(req) {
-  const origin = req.headers.origin;
-  if (origin && origin !== ORIGIN) throw fail(403, 'Request origin was rejected.');
-}
-
-async function hordeFetch(url, options = {}) {
-  let response;
-  try {
-    response = await fetch(url, { ...options, signal: AbortSignal.timeout(options.timeout || 120000) });
-  } catch (err) {
-    throw fail(502, `Could not reach AI Horde: ${err.name === 'TimeoutError' ? 'the request timed out' : 'check the internet connection and try again'}.`);
-  }
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const message = data?.error?.message || data?.message || `AI Horde returned HTTP ${response.status}.`;
-    throw fail(response.status === 429 ? 429 : 502, message);
-  }
-  return data;
-}
-
-let modelCache = { time: 0, data: [] };
-async function listModels() {
-  if (Date.now() - modelCache.time < 30000 && modelCache.data.length) return modelCache.data;
-  const data = await hordeFetch(`${CHAT_URL}/models`, {
-    headers: { Authorization: `Bearer ${CHAT_KEY}`, 'X-Title': 'NEXORAGPT', 'User-Agent': 'NEXORAGPT/1.0.0' }, timeout: 20000,
-  });
-  modelCache = { time: Date.now(), data: Array.isArray(data.data) ? data.data : [] };
-  return modelCache.data;
-}
-
-function dbChat(userId, chatId) {
-  const chat = db.prepare('SELECT * FROM chats WHERE id=? AND user_id=?').get(chatId, userId);
-  if (!chat) throw fail(404, 'Conversation not found.');
-  return chat;
-}
-
-async function createAssistantReply(user, chatId, fileIds = []) {
-  const chat = dbChat(user.id, chatId);
-  const messages = db.prepare('SELECT role, content FROM messages WHERE chat_id=? ORDER BY created_at, rowid').all(chatId);
-  const selectedModel = chat.model || process.env.AI_HORDE_DEFAULT_MODEL || user.settings.model || '';
-  const liveModels = await listModels();
-  const model = selectedModel || liveModels[0]?.id;
-  if (!model || !liveModels.some(item => item.id === model)) throw fail(503, 'No AI Horde chat model is available right now. Try again later or choose another model in Settings.');
-  const lastUserIndex = messages.map(m => m.role).lastIndexOf('user');
-  if (lastUserIndex < 0) throw fail(400, 'Send a message before requesting a reply.');
-  const fileRows = fileIds.length
-    ? fileIds.map(id => db.prepare('SELECT * FROM files WHERE id=? AND user_id=? AND chat_id=?').get(id, user.id, chatId)).filter(Boolean)
-    : db.prepare('SELECT * FROM files WHERE user_id=? AND chat_id=? ORDER BY created_at DESC LIMIT 8').all(user.id, chatId);
-  const context = messages.slice(-32).map(m => ({ role: m.role, content: m.content }));
-  if (fileRows.length) {
-    const textFiles = fileRows.filter(file => file.extracted_text).map(file => `\n\n[Uploaded file: ${file.name}]\n${file.extracted_text.slice(0, 30000)}`).join('');
-    if (textFiles) context[context.length - 1].content += textFiles;
-    const imageFiles = fileRows.filter(file => file.mime.startsWith('image/'));
-    for (const file of imageFiles.slice(0, 4)) {
-      const bytes = fs.readFileSync(file.disk_path);
-      if (bytes.length <= 5 * 1024 * 1024) {
-        const part = { type: 'image_url', image_url: { url: `data:${file.mime};base64,${bytes.toString('base64')}`, detail: 'auto' } };
-        const last = context[context.length - 1];
-        if (typeof last.content === 'string') last.content = [{ type: 'text', text: last.content }];
-        last.content.push(part);
-      }
+async function resolveIdentity(req, res, createGuest = true) {
+  if (!supabase) throw new Error('The private database has not been configured by the site owner.');
+  const token = cookieValue(req, cookieName);
+  if (token) {
+    const tokenHash = sha(token);
+    const { data: session } = await supabase.from('app_sessions').select('token_hash,user_id,is_admin,expires_at').eq('token_hash', tokenHash).gt('expires_at', new Date().toISOString()).maybeSingle();
+    if (session?.is_admin) return { user: { id: null, email: process.env.ADMIN_EMAIL || 'Owner', display_name: 'Owner', role: 'admin', is_guest: false }, isAdmin: true, tokenHash };
+    if (session?.user_id) {
+      const { data: user } = await supabase.from('app_users').select('id,email,display_name,role,is_guest,expires_at').eq('id', session.user_id).maybeSingle();
+      if (user && (!user.expires_at || Date.parse(user.expires_at) > Date.now())) return { user, isAdmin: user.role === 'admin', tokenHash };
     }
+    await supabase.from('app_sessions').delete().eq('token_hash', tokenHash);
+    clearSessionCookie(res);
   }
-  let reply;
-  try {
-    reply = await hordeFetch(`${CHAT_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${CHAT_KEY}`, 'X-Title': 'NEXORAGPT',
-        'Content-Type': 'application/json', 'User-Agent': 'NEXORAGPT/1.0.0',
-      },
-      body: JSON.stringify({ model, messages: [{ role: 'system', content: 'You are NEXORAGPT, a helpful and clear assistant. Be accurate, concise, and supportive. Never reveal private reasoning or internal control tokens.' }, ...context], max_tokens: 512, temperature: 0.7, ...(CHAT_IS_HORDE ? { horde: { include_reasoning: false, context_fit: 'truncate_oldest' } } : {}) }),
-    });
-  } catch (err) { throw err; }
-  const answer = cleanModelText(reply?.choices?.[0]?.message?.content);
-  if (!answer) throw fail(502, 'AI Horde returned an empty answer. You can try generating again.');
-  db.prepare('INSERT INTO messages(id,chat_id,role,content,created_at) VALUES(?,?,?,?,?)').run(uuid(), chatId, 'assistant', answer, now());
-  db.prepare('UPDATE chats SET model=?,updated_at=? WHERE id=?').run(reply.model || model, now(), chatId);
-  return { answer, model: reply.model || model };
+  if (!createGuest) return null;
+  const expiresAt = new Date(Date.now() + GUEST_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const { data: user, error } = await supabase.from('app_users').insert({ display_name: 'Guest', is_guest: true, role: 'user', expires_at: expiresAt }).select('id,email,display_name,role,is_guest,expires_at').single();
+  if (error) throw error;
+  await createSession(res, { userId: user.id });
+  await supabase.from('workspaces').insert({ user_id: user.id, state: defaultWorkspace() });
+  return { user, isAdmin: false };
 }
 
-const PLUGINS = [
-  { id: 'calculator', name: 'Calculator', category: 'Productivity', icon: '∑', description: 'Evaluate arithmetic expressions locally in your browser. No external service or account is needed.', permissions: 'Runs calculations you submit.' },
-  { id: 'weather', name: 'Weather', category: 'Research', icon: '☼', description: 'Get current conditions from Open-Meteo for a city or postal code.', permissions: 'Sends the location you enter to Open-Meteo.' },
-  { id: 'web_search', name: 'Web search', category: 'Research', icon: '⌕', description: 'Search the web using DuckDuckGo Instant Answers.', permissions: 'Sends your search query to DuckDuckGo.' },
-  { id: 'summarizer', name: 'Text summarizer', category: 'Writing', icon: '≡', description: 'Summarize text with the selected AI Horde chat model.', permissions: 'Sends the text you submit to AI Horde workers.' },
-  { id: 'translator', name: 'Translator', category: 'Writing', icon: '文', description: 'Translate text with a configured LibreTranslate server.', permissions: 'Sends text and language choices to the LibreTranslate URL in .env.', configured: Boolean(process.env.LIBRETRANSLATE_URL) },
-  { id: 'file_analysis', name: 'File analysis', category: 'Productivity', icon: '↥', description: 'Attach text, PDF, Word, or image files to a conversation for analysis.', permissions: 'Uploads are stored locally and relevant content is sent to AI Horde when you ask about a file.' },
-  { id: 'image_tools', name: 'Image studio', category: 'Image creation', icon: '▧', description: 'Generate and save images using the AI Horde worker network.', permissions: 'Your prompt is sent to AI Horde image workers.' },
-  { id: 'code_helper', name: 'Code helper', category: 'Coding', icon: '</>', description: 'Get code help through NEXORAGPT chat.', permissions: 'Sends conversation messages to AI Horde workers.' },
+async function requireUser(req, res, next) {
+  try {
+    const identity = await resolveIdentity(req, res, false);
+    if (!identity?.user?.id) return sendError(res, 401, 'Sign in to continue.');
+    req.identity = identity;
+    next();
+  } catch (error) { sendError(res, 503, 'GROQGPT is getting ready. Please try again shortly.'); }
+}
+async function requireAdmin(req, res, next) {
+  try {
+    const identity = await resolveIdentity(req, res, false);
+    if (!identity?.isAdmin) return sendError(res, 403, 'Owner access required.');
+    req.identity = identity;
+    next();
+  } catch { sendError(res, 403, 'Owner access required.'); }
+}
+
+function sanitizeWorkspace(input) {
+  const state = input && typeof input === 'object' ? input : {};
+  const arrays = ['chats', 'projects', 'assistants', 'folders', 'memory', 'images'];
+  const out = {};
+  for (const key of arrays) out[key] = Array.isArray(state[key]) ? state[key].slice(0, key === 'chats' ? 500 : 250) : [];
+  out.settings = state.settings && typeof state.settings === 'object' ? {
+    displayName: cleanName(state.settings.displayName || 'Guest'),
+    systemPrompt: String(state.settings.systemPrompt || '').slice(0, 6000),
+    memoryEnabled: state.settings.memoryEnabled !== false,
+    plugins: state.settings.plugins && typeof state.settings.plugins === 'object' ? state.settings.plugins : {},
+    theme: state.settings.theme === 'dark' ? 'dark' : 'light'
+  } : { memoryEnabled: true, theme: 'light' };
+  for (const chat of out.chats) {
+    chat.id = String(chat.id || randomUUID()).slice(0, 120);
+    chat.title = cleanName(chat.title);
+    chat.messages = Array.isArray(chat.messages) ? chat.messages.slice(-500).map(m => ({
+      role: ['user', 'assistant'].includes(m.role) ? m.role : 'user',
+      text: String(m.text || '').slice(0, 100_000),
+      content: String(m.content ?? m.text ?? '').slice(0, 100_000),
+      attachments: Array.isArray(m.attachments) ? m.attachments.slice(0, 15).map(a => ({ name: cleanName(a.name) })) : [],
+      created: Number(m.created) || Date.now()
+    })) : [];
+    chat.created = Number(chat.created) || Date.now();
+    chat.updated = Number(chat.updated) || chat.created;
+    chat.archived = Boolean(chat.archived);
+    chat.projectId = typeof chat.projectId === 'string' ? chat.projectId.slice(0, 120) : null;
+    chat.systemPrompt = String(chat.systemPrompt || '').slice(0, 6000);
+    chat.assistantName = String(chat.assistantName || '').slice(0, 120);
+  }
+  return out;
+}
+
+async function getWorkspace(userId) {
+  let { data, error } = await supabase.from('workspaces').select('state').eq('user_id', userId).maybeSingle();
+  if (error) throw error;
+  if (!data) {
+    const created = await supabase.from('workspaces').insert({ user_id: userId, state: defaultWorkspace() }).select('state').single();
+    if (created.error) throw created.error;
+    data = created.data;
+  }
+  return data.state || defaultWorkspace();
+}
+
+async function writeUsage(userId, eventType) {
+  try { await supabase.from('usage_events').insert({ user_id: userId, event_type: eventType, model: MODEL }); } catch {}
+}
+
+async function groqCompletion(messages, options = {}) {
+  return fetch(GROQ_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: MODEL, messages, max_completion_tokens: options.maxTokens || 4096, ...options.payload }),
+    signal: options.signal
+  });
+}
+
+const tools = [
+  { type: 'function', function: { name: 'calculator', description: 'Evaluate a basic arithmetic expression.', parameters: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'], additionalProperties: false } } },
+  { type: 'function', function: { name: 'weather', description: 'Get current weather and a short forecast for a city.', parameters: { type: 'object', properties: { location: { type: 'string' } }, required: ['location'], additionalProperties: false } } },
+  { type: 'function', function: { name: 'web_search', description: 'Search the web for current facts and sources.', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false } } },
+  { type: 'function', function: { name: 'search_library', description: 'Search the current visitor’s private uploaded files.', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false } } },
+  { type: 'function', function: { name: 'calendar_list', description: 'List upcoming events in the visitor’s private GROQGPT calendar.', parameters: { type: 'object', properties: { days: { type: 'integer', minimum: 1, maximum: 90 } }, additionalProperties: false } } }
 ];
 
-function safeFilename(name) { return path.basename(String(name || 'upload')).replace(/[^\w.() -]/g, '_').slice(0, 120) || 'upload'; }
-async function extractDocument(filename, mime, bytes) {
-  const ext = path.extname(filename).toLowerCase();
-  if (['.txt', '.md', '.csv', '.json', '.html', '.xml'].includes(ext) || mime.startsWith('text/')) return bytes.toString('utf8').slice(0, 60000);
-  if (ext === '.pdf' || mime === 'application/pdf') {
-    try {
-      const mod = await import('pdf-parse');
-      const parse = mod.default || mod;
-      const result = await parse(bytes);
-      return String(result.text || '').slice(0, 60000);
-    } catch (err) { if (err.status) throw err; throw fail(422, 'Could not read this PDF. Please check the file or try a text version.'); }
+function evaluateExpression(source) {
+  const tokens = String(source).replace(/×/g, '*').replace(/÷/g, '/').match(/\d+(?:\.\d+)?|[()+\-*/%^]/g);
+  if (!tokens || tokens.join('') !== String(source).replace(/\s/g, '').replace(/×/g, '*').replace(/÷/g, '/')) throw new Error('Use numbers and basic arithmetic operators.');
+  let at = 0;
+  const precedence = { '+': 1, '-': 1, '*': 2, '/': 2, '%': 2, '^': 3 };
+  function atom() {
+    const token = tokens[at++];
+    if (token === '-') return -atom();
+    if (token === '+') return atom();
+    if (token === '(') { const value = expr(0); if (tokens[at++] !== ')') throw new Error('Missing closing parenthesis.'); return value; }
+    const value = Number(token); if (!Number.isFinite(value)) throw new Error('Invalid expression.'); return value;
   }
-  if (ext === '.docx' || mime.includes('wordprocessingml')) {
-    try { const mod = await import('mammoth'); const result = await mod.extractRawText({ buffer: bytes }); return String(result.value || '').slice(0, 60000); }
-    catch (err) { if (err.status) throw err; throw fail(422, 'Could not read this Word document.'); }
+  function expr(min) {
+    let left = atom();
+    while (at < tokens.length) {
+      const op = tokens[at], p = precedence[op]; if (!p || p < min) break; at++;
+      const right = expr(p + (op === '^' ? 0 : 1));
+      if (op === '+') left += right; else if (op === '-') left -= right; else if (op === '*') left *= right; else if (op === '/') left /= right; else if (op === '%') left %= right; else left = left ** right;
+    }
+    return left;
   }
-  if (mime.startsWith('image/')) return '';
-  throw fail(415, 'Supported files are images, PDF, Word, text, Markdown, CSV, and JSON.');
+  const result = expr(0); if (at !== tokens.length || !Number.isFinite(result)) throw new Error('Invalid or non-finite result.'); return String(Number(result.toPrecision(12)));
 }
 
-async function routeApi(req, res, url) {
-  const method = req.method;
-  const pathname = url.pathname;
-  const parts = pathname.split('/').filter(Boolean).map(decodeURIComponent);
-  if (method !== 'GET' && method !== 'HEAD') checkOrigin(req);
-  const session = getSession(req);
-  const user = session;
-  const requireUser = () => { if (!user) throw fail(401, 'Sign in to continue.'); return user; };
-
-  if (pathname === '/api/health' && method === 'GET') return json(res, 200, { ok: true, provider: 'AI Horde' });
-  if (pathname === '/api/session' && method === 'GET') {
-    if (!user) return json(res, 200, { authenticated: false });
-    return json(res, 200, { authenticated: true, user: { email: user.email, username: user.username }, settings: user.settings });
+async function searchWeb(query) {
+  if (process.env.TAVILY_API_KEY) {
+    const response = await fetch('https://api.tavily.com/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: process.env.TAVILY_API_KEY, query, max_results: 5, include_answer: true }) });
+    const json = await response.json().catch(() => ({}));
+    if (response.ok) return { answer: json.answer || '', results: (json.results || []).map(x => ({ title: x.title, url: x.url, content: x.content })) };
   }
-  if (pathname === '/api/auth/register' && method === 'POST') {
-    enforceRate(req, 'register', 5, 60 * 60 * 1000);
-    const body = await readBody(req, 30000);
-    const email = String(body.email || '').trim().toLowerCase();
-    const username = String(body.username || '').trim();
-    const password = String(body.password || '');
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) throw fail(400, 'Enter a valid email address.');
-    if (username.length < 2 || username.length > 40) throw fail(400, 'Username must be 2 to 40 characters.');
-    if (password.length < 10 || password.length > 200) throw fail(400, 'Password must be at least 10 characters.');
-    if (db.prepare('SELECT id FROM users WHERE email=?').get(email)) throw fail(409, 'An account with this email already exists.');
-    const old = db.prepare('SELECT last_sent FROM pending WHERE email=?').get(email);
-    if (old && now() - old.last_sent < 60_000) throw fail(429, 'Please wait one minute before requesting another code.');
-    const code = randomCode(); const passwordHash = await hashPassword(password);
-    db.prepare(`INSERT INTO pending(email,username,password_hash,code_hash,expires_at,last_sent) VALUES(?,?,?,?,?,?)
-      ON CONFLICT(email) DO UPDATE SET username=excluded.username,password_hash=excluded.password_hash,code_hash=excluded.code_hash,expires_at=excluded.expires_at,last_sent=excluded.last_sent`)
-      .run(email, username, passwordHash, hashCode(email, code), now() + 10 * 60_000, now());
-    try { await sendVerification(email, code); }
-    catch (err) { db.prepare('DELETE FROM pending WHERE email=?').run(email); throw err; }
-    return json(res, 200, { message: 'Verification code sent. Check your inbox.' });
-  }
-  if (pathname === '/api/auth/verify' && method === 'POST') {
-    enforceRate(req, 'verify', 12, 60 * 60 * 1000);
-    const body = await readBody(req, 12000); const email = String(body.email || '').trim().toLowerCase(); const code = String(body.code || '').trim();
-    const pending = db.prepare('SELECT * FROM pending WHERE email=?').get(email);
-    if (!pending || pending.expires_at < now() || !safeEqual(pending.code_hash, hashCode(email, code))) throw fail(400, 'That code is invalid or expired. Request a new one and try again.');
-    const userId = uuid();
-    db.prepare('INSERT INTO users(id,email,username,password_hash,verified,created_at) VALUES(?,?,?,?,1,?)').run(userId, email, pending.username, pending.password_hash, now());
-    db.prepare('DELETE FROM pending WHERE email=?').run(email);
-    const token = crypto.randomBytes(32).toString('base64url');
-    db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)').run(sha(token), userId, now() + 30 * 24 * 60 * 60_000, now());
-    setSession(res, token);
-    return json(res, 200, { message: 'Email verified.', user: { email, username: pending.username } });
-  }
-  if (pathname === '/api/auth/resend' && method === 'POST') {
-    enforceRate(req, 'resend', 8, 60 * 60 * 1000);
-    const body = await readBody(req, 12000); const email = String(body.email || '').trim().toLowerCase();
-    const pending = db.prepare('SELECT * FROM pending WHERE email=?').get(email);
-    if (!pending) throw fail(404, 'No pending registration was found for this email.');
-    if (now() - pending.last_sent < 60_000) throw fail(429, 'Please wait one minute before requesting another code.');
-    const code = randomCode();
-    db.prepare('UPDATE pending SET code_hash=?,expires_at=?,last_sent=? WHERE email=?').run(hashCode(email, code), now() + 10 * 60_000, now(), email);
-    await sendVerification(email, code);
-    return json(res, 200, { message: 'A new verification code was sent.' });
-  }
-  if (pathname === '/api/auth/login' && method === 'POST') {
-    enforceRate(req, 'login', 10, 15 * 60_000);
-    const body = await readBody(req, 12000); const email = String(body.email || '').trim().toLowerCase();
-    const row = db.prepare('SELECT * FROM users WHERE email=?').get(email);
-    if (!row || !(await checkPassword(String(body.password || ''), row.password_hash))) throw fail(401, 'Email or password is incorrect.');
-    if (!row.verified) throw fail(403, 'Verify your email before signing in.');
-    const token = crypto.randomBytes(32).toString('base64url');
-    db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)').run(sha(token), row.id, now() + 30 * 24 * 60 * 60_000, now());
-    setSession(res, token);
-    return json(res, 200, { user: { email: row.email, username: row.username }, settings: JSON.parse(row.settings || '{}') });
-  }
-  if (pathname === '/api/auth/forgot' && method === 'POST') {
-    enforceRate(req, 'forgot', 8, 60 * 60_000);
-    const body = await readBody(req, 12000); const email = String(body.email || '').trim().toLowerCase();
-    const row = db.prepare('SELECT id FROM users WHERE email=? AND verified=1').get(email);
-    if (row) {
-      const old = db.prepare('SELECT last_sent FROM resets WHERE email=?').get(email);
-      if (old && now() - old.last_sent < 60_000) throw fail(429, 'Please wait one minute before requesting another code.');
-      const code = randomCode();
-      db.prepare(`INSERT INTO resets(email,code_hash,expires_at,last_sent) VALUES(?,?,?,?) ON CONFLICT(email) DO UPDATE SET code_hash=excluded.code_hash,expires_at=excluded.expires_at,last_sent=excluded.last_sent`)
-        .run(email, hashCode(email, code), now() + 10 * 60_000, now());
-      try { await sendVerification(email, code, true); }
-      catch (err) { db.prepare('DELETE FROM resets WHERE email=?').run(email); throw err; }
-    }
-    return json(res, 200, { message: 'If a verified account exists, a reset code has been sent.' });
-  }
-  if (pathname === '/api/auth/reset' && method === 'POST') {
-    enforceRate(req, 'reset', 10, 60 * 60_000);
-    const body = await readBody(req, 12000); const email = String(body.email || '').trim().toLowerCase(); const code = String(body.code || '').trim(); const password = String(body.password || '');
-    if (password.length < 10 || password.length > 200) throw fail(400, 'Password must be at least 10 characters.');
-    const row = db.prepare('SELECT * FROM resets WHERE email=?').get(email);
-    if (!row || row.expires_at < now() || !safeEqual(row.code_hash, hashCode(email, code))) throw fail(400, 'That code is invalid or expired.');
-    const hash = await hashPassword(password);
-    db.prepare('UPDATE users SET password_hash=? WHERE email=?').run(hash, email);
-    db.prepare('DELETE FROM resets WHERE email=?').run(email);
-    db.prepare('DELETE FROM sessions WHERE user_id=(SELECT id FROM users WHERE email=?)').run(email);
-    return json(res, 200, { message: 'Password updated. Sign in with your new password.' });
-  }
-  if (pathname === '/api/auth/logout' && method === 'POST') {
-    if (session) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(session.tokenHash);
-    res.setHeader('Set-Cookie', 'nexora_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
-    return json(res, 200, { message: 'Signed out.' });
-  }
-
-  if (pathname === '/api/profile' && method === 'GET') {
-    requireUser();
-    const row = db.prepare('SELECT email,username,settings FROM users WHERE id=?').get(user.id);
-    return json(res, 200, { email: row.email, username: row.username, settings: JSON.parse(row.settings || '{}') });
-  }
-  if (pathname === '/api/profile' && method === 'PATCH') {
-    requireUser(); const body = await readBody(req, 12000); const username = String(body.username || '').trim();
-    if (username.length < 2 || username.length > 40) throw fail(400, 'Username must be 2 to 40 characters.');
-    db.prepare('UPDATE users SET username=? WHERE id=?').run(username, user.id);
-    return json(res, 200, { username });
-  }
-  if (pathname === '/api/email/change' && method === 'POST') {
-    requireUser(); enforceRate(req, 'email-change', 8, 60 * 60_000);
-    const body = await readBody(req, 12000); const email = String(body.email || '').trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) throw fail(400, 'Enter a valid email address.');
-    if (email === user.email.toLowerCase()) throw fail(400, 'That is already your verified email address.');
-    if (db.prepare('SELECT id FROM users WHERE email=?').get(email)) throw fail(409, 'An account already uses that email address.');
-    const old = db.prepare('SELECT last_sent FROM pending_email WHERE user_id=?').get(user.id);
-    if (old && now() - old.last_sent < 60_000) throw fail(429, 'Please wait one minute before requesting another code.');
-    const code = randomCode();
-    db.prepare(`INSERT INTO pending_email(user_id,email,code_hash,expires_at,last_sent) VALUES(?,?,?,?,?)
-      ON CONFLICT(user_id) DO UPDATE SET email=excluded.email,code_hash=excluded.code_hash,expires_at=excluded.expires_at,last_sent=excluded.last_sent`)
-      .run(user.id, email, hashCode(email, code), now() + 10 * 60_000, now());
-    try { await sendVerification(email, code); }
-    catch (err) { db.prepare('DELETE FROM pending_email WHERE user_id=?').run(user.id); throw err; }
-    return json(res, 200, { message: 'A verification code was sent to the new email address.' });
-  }
-  if (pathname === '/api/email/verify' && method === 'POST') {
-    requireUser(); enforceRate(req, 'email-verify', 12, 60 * 60_000);
-    const body = await readBody(req, 12000); const code = String(body.code || '').trim();
-    const pending = db.prepare('SELECT * FROM pending_email WHERE user_id=?').get(user.id);
-    if (!pending || pending.expires_at < now() || !safeEqual(pending.code_hash, hashCode(pending.email, code))) throw fail(400, 'That code is invalid or expired. Request a new one and try again.');
-    if (db.prepare('SELECT id FROM users WHERE email=? AND id<>?').get(pending.email, user.id)) throw fail(409, 'An account now uses that email. Request another address.');
-    db.prepare('UPDATE users SET email=? WHERE id=?').run(pending.email, user.id);
-    db.prepare('DELETE FROM pending_email WHERE user_id=?').run(user.id);
-    return json(res, 200, { email: pending.email, message: 'Email address updated and verified.' });
-  }
-  if (pathname === '/api/password' && method === 'POST') {
-    requireUser(); const body = await readBody(req, 12000);
-    const row = db.prepare('SELECT password_hash FROM users WHERE id=?').get(user.id);
-    if (!(await checkPassword(String(body.currentPassword || ''), row.password_hash))) throw fail(401, 'Current password is incorrect.');
-    const nextPassword = String(body.newPassword || '');
-    if (nextPassword.length < 10 || nextPassword.length > 200) throw fail(400, 'New password must be at least 10 characters.');
-    db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(await hashPassword(nextPassword), user.id);
-    db.prepare('DELETE FROM sessions WHERE user_id=? AND token_hash<>?').run(user.id, user.tokenHash);
-    return json(res, 200, { message: 'Password updated.' });
-  }
-  if (pathname === '/api/settings' && method === 'PATCH') {
-    requireUser(); const body = await readBody(req, 12000); const current = user.settings || {};
-    const next = { ...current, theme: ['light', 'dark', 'system'].includes(body.theme) ? body.theme : current.theme || 'light', model: typeof body.model === 'string' ? body.model.slice(0, 200) : current.model || '' };
-    db.prepare('UPDATE users SET settings=? WHERE id=?').run(JSON.stringify(next), user.id);
-    return json(res, 200, next);
-  }
-  if (pathname === '/api/account' && method === 'DELETE') {
-    requireUser(); const body = await readBody(req, 12000); const row = db.prepare('SELECT password_hash FROM users WHERE id=?').get(user.id);
-    if (!(await checkPassword(String(body.password || ''), row.password_hash))) throw fail(401, 'Password is incorrect.');
-    for (const base of [path.join(UPLOADS, user.id), path.join(IMAGES, user.id)]) if (fs.existsSync(base)) fs.rmSync(base, { recursive: true, force: true });
-    db.prepare('DELETE FROM users WHERE id=?').run(user.id);
-    res.setHeader('Set-Cookie', 'nexora_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
-    return json(res, 200, { message: 'Account deleted.' });
-  }
-
-  if (pathname === '/api/models' && method === 'GET') {
-    requireUser(); const models = await listModels();
-    return json(res, 200, { models: models.map(m => ({ id: m.id, name: m.name || m.id, workers: m.x_horde?.workers || 0, queued: m.x_horde?.queued || 0, context: m.context_length || 0 })) });
-  }
-
-  if (pathname === '/api/chats' && method === 'GET') {
-    requireUser(); const term = String(url.searchParams.get('q') || '').trim().slice(0, 100);
-    const query = term ? `%${term.replace(/[\\%_]/g, '\\$&')}%` : '%';
-    const rows = db.prepare(`SELECT c.id,c.title,c.model,c.created_at,c.updated_at,
-      (SELECT content FROM messages WHERE chat_id=c.id ORDER BY created_at DESC,rowid DESC LIMIT 1) AS preview
-      FROM chats c WHERE c.user_id=? AND (c.title LIKE ? ESCAPE '\\' OR EXISTS(SELECT 1 FROM messages m WHERE m.chat_id=c.id AND m.content LIKE ? ESCAPE '\\'))
-      ORDER BY c.updated_at DESC LIMIT 100`).all(user?.id || '', query, query);
-    if (!user) throw fail(401, 'Sign in to continue.');
-    return json(res, 200, { chats: rows });
-  }
-  if (pathname === '/api/chats' && method === 'POST') {
-    requireUser(); const id = uuid(); const title = 'New chat'; const stamp = now();
-    db.prepare('INSERT INTO chats(id,user_id,title,model,created_at,updated_at) VALUES(?,?,?,?,?,?)').run(id, user.id, title, user.settings.model || '', stamp, stamp);
-    return json(res, 201, { id, title, created_at: stamp });
-  }
-  if (parts[0] === 'api' && parts[1] === 'chats' && parts[2] && parts.length === 3 && method === 'GET') {
-    requireUser(); const chat = dbChat(user.id, parts[2]);
-    const messages = db.prepare('SELECT id,role,content,created_at FROM messages WHERE chat_id=? ORDER BY created_at,rowid').all(chat.id);
-    const files = db.prepare('SELECT id,name,mime,created_at FROM files WHERE user_id=? AND chat_id=? ORDER BY created_at').all(user.id, chat.id);
-    return json(res, 200, { chat, messages, files });
-  }
-  if (parts[0] === 'api' && parts[1] === 'chats' && parts[2] && parts.length === 3 && method === 'PATCH') {
-    requireUser(); dbChat(user.id, parts[2]); const body = await readBody(req, 12000); const title = String(body.title || '').trim();
-    if (!title || title.length > 100) throw fail(400, 'Chat title must be 1 to 100 characters.');
-    db.prepare('UPDATE chats SET title=?,updated_at=? WHERE id=?').run(title, now(), parts[2]);
-    return json(res, 200, { title });
-  }
-  if (parts[0] === 'api' && parts[1] === 'chats' && parts[2] && parts.length === 3 && method === 'DELETE') {
-    requireUser(); dbChat(user.id, parts[2]);
-    const attachments = db.prepare('SELECT disk_path FROM files WHERE user_id=? AND chat_id=?').all(user.id, parts[2]);
-    for (const file of attachments) if (fs.existsSync(file.disk_path)) fs.rmSync(file.disk_path, { force: true });
-    db.prepare('DELETE FROM files WHERE user_id=? AND chat_id=?').run(user.id, parts[2]);
-    db.prepare('DELETE FROM chats WHERE id=?').run(parts[2]);
-    return json(res, 200, { message: 'Conversation deleted.' });
-  }
-  if (parts[0] === 'api' && parts[1] === 'chats' && parts[2] && parts[3] === 'messages' && method === 'POST') {
-    requireUser(); const chat = dbChat(user.id, parts[2]); const body = await readBody(req, 30000);
-    const content = String(body.message || '').trim().slice(0, 20000);
-    if (!content) throw fail(400, 'Write a message first.');
-    const fileIds = Array.isArray(body.fileIds) ? body.fileIds.slice(0, 8).map(String) : [];
-    if (fileIds.length) {
-      const owned = fileIds.map(id => db.prepare('SELECT id FROM files WHERE id=? AND user_id=? AND (chat_id=? OR chat_id IS NULL)').get(id, user.id, chat.id)).filter(Boolean);
-      if (owned.length !== fileIds.length) throw fail(403, 'One of those files is not available in this conversation.');
-      db.prepare(`UPDATE files SET chat_id=? WHERE id IN (${fileIds.map(() => '?').join(',')}) AND user_id=?`).run(chat.id, ...fileIds, user.id);
-    }
-    const first = db.prepare('SELECT COUNT(*) AS total FROM messages WHERE chat_id=?').get(chat.id).total === 0;
-    db.prepare('INSERT INTO messages(id,chat_id,role,content,created_at) VALUES(?,?,?,?,?)').run(uuid(), chat.id, 'user', content, now());
-    if (first) db.prepare('UPDATE chats SET title=?,updated_at=? WHERE id=?').run(content.slice(0, 48) + (content.length > 48 ? '…' : ''), now(), chat.id);
-    try {
-      const result = await createAssistantReply(user, chat.id, fileIds);
-      const messages = db.prepare('SELECT id,role,content,created_at FROM messages WHERE chat_id=? ORDER BY created_at,rowid').all(chat.id);
-      return json(res, 200, { ...result, chatId: chat.id, title: dbChat(user.id, chat.id).title, messages });
-    } catch (err) { throw err; }
-  }
-  if (parts[0] === 'api' && parts[1] === 'chats' && parts[2] && parts[3] === 'regenerate' && method === 'POST') {
-    requireUser(); const chat = dbChat(user.id, parts[2]);
-    const last = db.prepare('SELECT * FROM messages WHERE chat_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1').get(chat.id);
-    if (!last || !['assistant', 'user'].includes(last.role)) throw fail(400, 'There is no answer to generate yet.');
-    if (last.role === 'assistant') db.prepare('DELETE FROM messages WHERE id=?').run(last.id);
-    const result = await createAssistantReply(user, chat.id);
-    const messages = db.prepare('SELECT id,role,content,created_at FROM messages WHERE chat_id=? ORDER BY created_at,rowid').all(chat.id);
-    return json(res, 200, { ...result, messages });
-  }
-
-  if (pathname === '/api/files' && method === 'POST') {
-    requireUser(); const body = await readBody(req, 12 * 1024 * 1024);
-    const name = safeFilename(body.name); const mime = String(body.mime || 'application/octet-stream').slice(0, 120);
-    const encoded = String(body.data || '').replace(/^data:[^,]*;base64,/, '');
-    if (!encoded || encoded.length > 11 * 1024 * 1024) throw fail(400, 'Choose a file smaller than 8 MB.');
-    const bytes = Buffer.from(encoded, 'base64');
-    if (!bytes.length || bytes.length > 8 * 1024 * 1024) throw fail(400, 'Choose a non-empty file smaller than 8 MB.');
-    if (mime.startsWith('image/') && bytes.length > 5 * 1024 * 1024) throw fail(400, 'AI Horde accepts source images up to 5 MB. Choose a smaller image.');
-    const extracted = await extractDocument(name, mime, bytes);
-    const ext = path.extname(name).toLowerCase().replace(/[^.a-z0-9]/g, '').slice(0, 10) || '.bin';
-    const id = uuid(); const diskPath = path.join(UPLOADS, user.id, `${id}${ext}`);
-    fs.mkdirSync(path.dirname(diskPath), { recursive: true }); fs.writeFileSync(diskPath, bytes, { flag: 'wx' });
-    db.prepare('INSERT INTO files(id,user_id,chat_id,name,mime,disk_path,extracted_text,created_at) VALUES(?,?,NULL,?,?,?,?,?)')
-      .run(id, user.id, name, mime, diskPath, extracted, now());
-    return json(res, 201, { file: { id, name, mime, extracted: Boolean(extracted) } });
-  }
-  if (parts[0] === 'api' && parts[1] === 'files' && parts[2] && parts.length === 3 && method === 'DELETE') {
-    requireUser(); const file = db.prepare('SELECT disk_path FROM files WHERE id=? AND user_id=?').get(parts[2], user.id);
-    if (!file) throw fail(404, 'Uploaded file not found.');
-    if (fs.existsSync(file.disk_path)) fs.rmSync(file.disk_path, { force: true });
-    db.prepare('DELETE FROM files WHERE id=? AND user_id=?').run(parts[2], user.id);
-    return json(res, 200, { message: 'Uploaded file deleted.' });
-  }
-
-  if (pathname === '/api/plugins' && method === 'GET') {
-    requireUser();
-    const prefs = db.prepare('SELECT plugin_id,enabled FROM plugin_prefs WHERE user_id=?').all(user.id);
-    const enabled = new Map(prefs.map(p => [p.plugin_id, Boolean(p.enabled)]));
-    return json(res, 200, { plugins: PLUGINS.map(plugin => ({ ...plugin, enabled: enabled.get(plugin.id) || false })) });
-  }
-  if (pathname === '/api/plugins' && method === 'PATCH') {
-    requireUser(); const body = await readBody(req, 12000); const plugin = PLUGINS.find(item => item.id === body.id);
-    if (!plugin) throw fail(404, 'Plugin not found.');
-    if (plugin.id === 'translator' && !process.env.LIBRETRANSLATE_URL) throw fail(503, 'Translator is not configured. Add LIBRETRANSLATE_URL to .env first.');
-    db.prepare(`INSERT INTO plugin_prefs(user_id,plugin_id,enabled) VALUES(?,?,?) ON CONFLICT(user_id,plugin_id) DO UPDATE SET enabled=excluded.enabled`).run(user.id, plugin.id, body.enabled ? 1 : 0);
-    return json(res, 200, { id: plugin.id, enabled: Boolean(body.enabled) });
-  }
-  if (pathname === '/api/plugins/run' && method === 'POST') {
-    requireUser(); const body = await readBody(req, 30000); const id = String(body.id || ''); const input = String(body.input || '').trim();
-    const pref = db.prepare('SELECT enabled FROM plugin_prefs WHERE user_id=? AND plugin_id=?').get(user.id, id);
-    if (!pref?.enabled) throw fail(403, 'Enable this plugin first.');
-    if (!input) throw fail(400, 'Enter something for the plugin to work on.');
-    if (id === 'calculator') {
-      if (!/^[\d\s()+\-*/%.^,]+$/.test(input) || input.length > 120) throw fail(400, 'Use numbers and arithmetic operators only.');
-      const expression = input.replace(/\^/g, '**').replace(/,/g, '.');
-      const result = Function(`"use strict"; return (${expression});`)();
-      if (!Number.isFinite(result)) throw fail(400, 'That expression did not produce a finite number.');
-      return json(res, 200, { result: String(result) });
-    }
-    if (id === 'weather') {
-      const geo = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(input)}&count=1&language=en&format=json`, { signal: AbortSignal.timeout(15000) });
-      const location = (await geo.json()).results?.[0];
-      if (!location) throw fail(404, `No location found for “${input}”.`);
-      const forecastResponse = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${location.latitude}&longitude=${location.longitude}&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m&timezone=auto`, { signal: AbortSignal.timeout(15000) });
-      const forecast = await forecastResponse.json(); const c = forecast.current;
-      return json(res, 200, { result: `${location.name}${location.admin1 ? `, ${location.admin1}` : ''}: ${c.temperature_2m}°C, feels like ${c.apparent_temperature}°C, humidity ${c.relative_humidity_2m}%, wind ${c.wind_speed_10m} km/h. Updated ${c.time}.` });
-    }
-    if (id === 'web_search') {
-      const response = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(input)}&format=json&no_html=1&skip_disambig=1`, { headers: { 'User-Agent': 'NEXORAGPT/1.0.0' }, signal: AbortSignal.timeout(15000) });
-      const data = await response.json(); const results = [];
-      if (data.AbstractText) results.push({ title: data.Heading || 'Overview', text: data.AbstractText, url: data.AbstractURL });
-      for (const item of data.RelatedTopics || []) {
-        if (item.Text && item.FirstURL) results.push({ title: item.Text.split(' - ')[0], text: item.Text, url: item.FirstURL });
-        for (const child of item.Topics || []) if (child.Text && child.FirstURL) results.push({ title: child.Text.split(' - ')[0], text: child.Text, url: child.FirstURL });
-      }
-      if (!results.length) throw fail(404, 'DuckDuckGo did not return an instant-answer result for that query.');
-      return json(res, 200, { results: results.slice(0, 8) });
-    }
-    if (id === 'translator') {
-      if (!process.env.LIBRETRANSLATE_URL) throw fail(503, 'Translator is not configured. Add LIBRETRANSLATE_URL to .env first.');
-      const [source, target, ...textParts] = input.split('|');
-      if (!source || !target || !textParts.length) throw fail(400, 'Use the format: source|target|text (for example: en|fr|Hello).');
-      const payload = { q: textParts.join('|'), source: source.trim(), target: target.trim(), format: 'text' };
-      if (process.env.LIBRETRANSLATE_API_KEY) payload.api_key = process.env.LIBRETRANSLATE_API_KEY;
-      const result = await fetch(`${process.env.LIBRETRANSLATE_URL.replace(/\/$/, '')}/translate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(20000) });
-      const data = await result.json(); if (!result.ok) throw fail(502, data.error || 'Translation service returned an error.');
-      return json(res, 200, { result: data.translatedText });
-    }
-    if (id === 'summarizer') {
-      const models = await listModels(); const model = user.settings.model || process.env.AI_HORDE_DEFAULT_MODEL || models[0]?.id;
-      if (!model) throw fail(503, 'No AI Horde chat model is available right now.');
-      const result = await hordeFetch(`${CHAT_URL}/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${CHAT_KEY}`, 'X-Title': 'NEXORAGPT', 'Content-Type': 'application/json', 'User-Agent': 'NEXORAGPT/1.0.0' }, body: JSON.stringify({ model, messages: [{ role: 'system', content: 'Summarize the provided text accurately and clearly. Do not invent details.' }, { role: 'user', content: input.slice(0, 20000) }], max_tokens: 512, ...(CHAT_IS_HORDE ? { horde: { include_reasoning: false } } : {}) }) });
-      return json(res, 200, { result: cleanModelText(result.choices?.[0]?.message?.content || '') });
-    }
-    throw fail(400, 'This plugin opens from the main chat or image studio.');
-  }
-
-  if (pathname === '/api/images' && method === 'GET') {
-    requireUser(); const images = db.prepare('SELECT id,prompt,style,width,height,status,mime,created_at,wait_time FROM images WHERE user_id=? ORDER BY created_at DESC LIMIT 50').all(user.id);
-    return json(res, 200, { images: images.map(image => ({ ...image, url: image.status === 'done' ? `/api/images/${image.id}/file` : '' })) });
-  }
-  if (pathname === '/api/images' && method === 'POST') {
-    requireUser(); enforceRate(req, 'image', 10, 60 * 60_000); const body = await readBody(req, 20000);
-    const prompt = String(body.prompt || '').trim().slice(0, 1000);
-    const width = Math.round(Number(body.width || 512)); const height = Math.round(Number(body.height || 512));
-    const style = String(body.style || 'none');
-    if (!prompt) throw fail(400, 'Write an image prompt first.');
-    if (![width, height].every(value => Number.isInteger(value) && value >= 512 && value <= 1024 && value % 64 === 0)) throw fail(400, 'Choose supported image dimensions between 512 and 1024 pixels.');
-    const stylePrompts = {
-      none: '', watercolor: ', watercolor painting, soft transparent washes, subtle paper texture',
-      photo: ', photorealistic photography, natural lighting, detailed image',
-      anime: ', anime illustration, expressive linework, vibrant cel shading',
-      pixel: ', pixel art, crisp pixels, limited color palette',
-      digital: ', polished digital illustration, refined details, clear composition',
-    };
-    if (!Object.hasOwn(stylePrompts, style)) throw fail(400, 'Choose a supported image style.');
-    const hordePrompt = `${prompt}${stylePrompts[style]}`;
-    const response = await hordeFetch(`${HORDE_API}/v2/generate/async`, {
-      method: 'POST', headers: { apikey: HORDE_KEY, 'Client-Agent': CLIENT_AGENT, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: hordePrompt, params: { width, height, n: 1, steps: 25, cfg_scale: 7, sampler_name: 'k_euler' }, r2: true }), timeout: 30000,
-    });
-    if (!response.id) throw fail(502, 'AI Horde did not accept the image request.');
-    const id = uuid();
-    db.prepare('INSERT INTO images(id,user_id,horde_id,prompt,style,width,height,status,created_at,wait_time) VALUES(?,?,?,?,?,?,?,?,?,?)').run(id, user.id, response.id, prompt, style, width, height, 'waiting', now(), response.wait_time || 0);
-    return json(res, 202, { id, status: 'waiting', wait_time: response.wait_time || 0, message: 'Your image is in the AI Horde queue.' });
-  }
-  if (parts[0] === 'api' && parts[1] === 'images' && parts[2] && parts.length === 3 && method === 'GET') {
-    requireUser(); const image = db.prepare('SELECT * FROM images WHERE id=? AND user_id=?').get(parts[2], user.id);
-    if (!image) throw fail(404, 'Image request not found.');
-    if (image.status === 'done') return json(res, 200, { id: image.id, status: 'done', prompt: image.prompt, style: image.style, url: `/api/images/${image.id}/file`, wait_time: image.wait_time });
-    if (image.status === 'faulted') return json(res, 200, { id: image.id, status: 'faulted', message: 'AI Horde could not complete this image request. Try another prompt or retry later.' });
-    const check = await hordeFetch(`${HORDE_API}/v2/generate/check/${encodeURIComponent(image.horde_id)}`, { headers: { 'Client-Agent': CLIENT_AGENT }, timeout: 20000 });
-    const wait = check.wait_time || image.wait_time || 0;
-    if (check.faulted) {
-      db.prepare('UPDATE images SET status=?,wait_time=? WHERE id=?').run('faulted', wait, image.id);
-      return json(res, 200, { id: image.id, status: 'faulted', message: 'AI Horde could not complete this image request.' });
-    }
-    if (!check.done) {
-      db.prepare('UPDATE images SET status=?,wait_time=? WHERE id=?').run(check.processing ? 'processing' : 'waiting', wait, image.id);
-      return json(res, 200, { id: image.id, status: check.processing ? 'processing' : 'waiting', wait_time: wait });
-    }
-    const full = await hordeFetch(`${HORDE_API}/v2/generate/status/${encodeURIComponent(image.horde_id)}`, { headers: { 'Client-Agent': CLIENT_AGENT }, timeout: 30000 });
-    const generated = full.generations?.[0];
-    if (!generated?.img) {
-      db.prepare('UPDATE images SET status=? WHERE id=?').run('faulted', image.id);
-      return json(res, 200, { id: image.id, status: 'faulted', message: 'AI Horde finished without returning an image.' });
-    }
-    const response = await fetch(generated.img, { signal: AbortSignal.timeout(60000) });
-    if (!response.ok) throw fail(502, 'Generated image could not be downloaded from AI Horde.');
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (!bytes.length || bytes.length > 25 * 1024 * 1024) throw fail(502, 'AI Horde returned an image outside the supported size.');
-    const mime = response.headers.get('content-type')?.split(';')[0] || 'image/webp';
-    const ext = mime.split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'webp';
-    const diskPath = path.join(IMAGES, user.id, `${image.id}.${ext}`); fs.mkdirSync(path.dirname(diskPath), { recursive: true }); fs.writeFileSync(diskPath, bytes, { flag: 'w' });
-    db.prepare('UPDATE images SET status=?,disk_path=?,mime=?,wait_time=? WHERE id=?').run('done', diskPath, mime, wait, image.id);
-    return json(res, 200, { id: image.id, status: 'done', prompt: image.prompt, style: image.style, url: `/api/images/${image.id}/file`, wait_time: wait });
-  }
-  if (parts[0] === 'api' && parts[1] === 'images' && parts[2] && parts[3] === 'file' && method === 'GET') {
-    requireUser(); const image = db.prepare('SELECT disk_path,mime FROM images WHERE id=? AND user_id=? AND status=?').get(parts[2], user.id, 'done');
-    if (!image || !fs.existsSync(image.disk_path)) throw fail(404, 'Generated image is not available.');
-    res.writeHead(200, { 'Content-Type': image.mime, 'Content-Length': fs.statSync(image.disk_path).size, 'Cache-Control': 'private, max-age=3600', 'Content-Disposition': `inline; filename="nexoragpt-${parts[2]}.${image.mime.split('/')[1] || 'webp'}"` });
-    return fs.createReadStream(image.disk_path).pipe(res);
-  }
-
-  throw fail(404, 'API route not found.');
-}
-
-const mimeTypes = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' };
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   try {
-    if (url.pathname.startsWith('/api/')) return await routeApi(req, res, url);
-    const requested = decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname);
-    const filePath = path.resolve(PUBLIC, `.${requested}`);
-    if (!filePath.startsWith(PUBLIC + path.sep) && filePath !== path.join(PUBLIC, 'index.html')) throw fail(403, 'Forbidden.');
-    const stat = await fs.promises.stat(filePath).catch(() => null);
-    if (!stat?.isFile()) throw fail(404, 'Page not found.');
-    res.writeHead(200, { 'Content-Type': mimeTypes[path.extname(filePath)] || 'application/octet-stream', 'Content-Length': stat.size, 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Content-Security-Policy': "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" });
-    fs.createReadStream(filePath).pipe(res);
-  } catch (err) {
-    if (res.headersSent) return res.destroy();
-    const status = Number(err.status) || 500;
-    if (status >= 500) console.error(`[${status}] ${req.method} ${url.pathname}: ${err.stack || err.message}`);
-    json(res, status, { error: err.message || 'Something went wrong.', ...err.extra });
+    const response = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`, { signal: AbortSignal.timeout(10_000) });
+    const json = await response.json().catch(() => ({}));
+    const related = (json.RelatedTopics || []).flatMap(item => item.Topics || [item]).filter(item => item.Text && item.FirstURL).slice(0, 8).map(item => ({ title: item.Text, url: item.FirstURL, content: item.Text }));
+    return { answer: json.AbstractText || '', heading: json.Heading || '', source: json.AbstractURL || '', results: related };
+  } catch { return { error: 'Web search is temporarily unavailable.' }; }
+}
+
+async function getWeather(location) {
+  const geoResponse = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=en&format=json`);
+  const geo = await geoResponse.json().catch(() => ({})); const place = geo.results?.[0];
+  if (!place) return { error: `No location found for ${location}.` };
+  const response = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=3`);
+  const weather = await response.json().catch(() => ({}));
+  return { location: `${place.name}${place.admin1 ? `, ${place.admin1}` : ''}`, current: weather.current, daily: weather.daily };
+}
+
+async function executeTool(name, args, userId) {
+  if (name === 'calculator') return { result: evaluateExpression(args.expression) };
+  if (name === 'weather') return getWeather(args.location);
+  if (name === 'web_search') return searchWeb(args.query);
+  if (name === 'search_library') {
+    const { data, error } = await supabase.from('library_files').select('name,extracted_text,project_id').eq('user_id', userId).textSearch('search_vector', args.query, { type: 'websearch', config: 'english' }).limit(5);
+    if (error) return { error: 'Could not search the private library.' };
+    return { results: (data || []).map(file => ({ name: file.name, excerpt: file.extracted_text.slice(0, 1600) })) };
   }
+  if (name === 'calendar_list') {
+    const from = new Date().toISOString(), to = new Date(Date.now() + Math.min(90, Math.max(1, Number(args.days) || 7) * 86_400_000)).toISOString();
+    const { data, error } = await supabase.from('calendar_events').select('title,description,starts_at,ends_at').eq('user_id', userId).gte('starts_at', from).lte('starts_at', to).order('starts_at').limit(50);
+    return error ? { error: 'Calendar is unavailable.' } : { events: data || [] };
+  }
+  return { error: 'This tool is not available.' };
+}
+
+async function workspaceContext(userId, projectId) {
+  const state = await getWorkspace(userId);
+  const pieces = [];
+  if (state.settings?.systemPrompt) pieces.push(`Visitor preferences:\n${state.settings.systemPrompt}`);
+  if (state.settings?.memoryEnabled !== false && state.memory?.length) pieces.push(`Saved memory:\n${state.memory.map(item => typeof item === 'string' ? item : item.content).filter(Boolean).join('\n')}`);
+  if (projectId) {
+    const project = state.projects?.find(x => x.id === projectId);
+    if (project) pieces.push(`Current project: ${project.name}\n${project.instructions || ''}`);
+  }
+  return pieces.length ? pieces.join('\n\n') : '';
+}
+
+async function chatHandler(req, res) {
+  if (!isConfigured()) return sendError(res, 503, 'Chat service is temporarily unavailable.');
+  const input = req.body?.messages;
+  if (!Array.isArray(input) || input.length < 1 || input.length > 100) return sendError(res, 400, 'Send between 1 and 100 messages.');
+  let total = 0;
+  const messages = input.filter(m => m && ['user', 'assistant'].includes(m.role)).map(m => {
+    const content = String(m.text ?? m.content ?? '').slice(0, 100_000); total += content.length; return { role: m.role, content };
+  });
+  if (total > 400_000 || !messages.some(m => m.role === 'user')) return sendError(res, 413, 'Conversation is too long or has no user message.');
+  const controller = new AbortController();
+  try {
+    const privateContext = await workspaceContext(req.identity.user.id, req.body.projectId);
+    const system = [`You are GROQGPT, a helpful assistant powered by OpenAI GPT OSS 120B on Groq. Be accurate and clearly say when you do not know. You may use the provided tools for live web search, calculations, weather, private library search, or calendar lookup. Never claim a tool ran unless a tool result is present.`, privateContext].filter(Boolean).join('\n\n');
+    const prompt = [{ role: 'system', content: system }, ...messages];
+    const plugins = await getWorkspace(req.identity.user.id).then(x => x.settings?.plugins || {});
+    const enabledTools = tools.filter(t => {
+      const id = t.function.name;
+      if (id === 'web_search') return plugins.web_search !== false && Boolean(process.env.TAVILY_API_KEY);
+      if (id === 'weather') return plugins.weather !== false;
+      if (id === 'calculator') return plugins.calculator !== false;
+      if (id === 'search_library') return plugins.file_analyzer !== false;
+      return plugins.calendar !== false;
+    });
+    res.status(200).set({ 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no' });
+    res.flushHeaders();
+    res.on('close', () => { if (!res.writableEnded) controller.abort(); });
+    let done = false;
+    for (let turn = 0; turn < 5 && !done; turn++) {
+      const upstream = await groqCompletion(prompt, { signal: controller.signal, payload: { stream: true, tools: enabledTools, tool_choice: enabledTools.length ? 'auto' : 'none' } });
+      if (!upstream.ok) {
+        const err = await upstream.json().catch(() => ({}));
+        res.write(`data: ${JSON.stringify({ error: err.error?.message || 'AI service is temporarily unavailable.' })}\n\n`);
+        break;
+      }
+      let buffer = '', toolCalls = {}, finishReason = null;
+      const reader = upstream.body.getReader(); const decoder = new TextDecoder();
+      while (true) {
+        const { value, done: ended } = await reader.read(); if (ended) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n'); buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const datum = line.slice(5).trim(); if (!datum || datum === '[DONE]') continue;
+          let part; try { part = JSON.parse(datum); } catch { continue; }
+          const choice = part.choices?.[0]; const delta = choice?.delta;
+          if (typeof delta?.content === 'string') res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: delta.content } }] })}\n\n`);
+          if (Array.isArray(delta?.tool_calls)) for (const item of delta.tool_calls) {
+            const entry = toolCalls[item.index] ||= { id: '', type: 'function', function: { name: '', arguments: '' } };
+            if (item.id) entry.id += item.id;
+            if (item.function?.name) entry.function.name += item.function.name;
+            if (item.function?.arguments) entry.function.arguments += item.function.arguments;
+          }
+          if (choice?.finish_reason) finishReason = choice.finish_reason;
+        }
+      }
+      const calls = Object.values(toolCalls);
+      if (finishReason === 'tool_calls' && calls.length) {
+        prompt.push({ role: 'assistant', content: null, tool_calls: calls });
+        for (const call of calls) {
+          let args = {}; try { args = JSON.parse(call.function.arguments || '{}'); } catch {}
+          const status = { calculator: 'Calculating…', weather: 'Checking the forecast…', web_search: 'Searching the web…', search_library: 'Searching your library…', calendar_list: 'Checking your calendar…' }[call.function.name] || 'Using a tool…';
+          res.write(`data: ${JSON.stringify({ status })}\n\n`);
+          let result;
+          try { result = await executeTool(call.function.name, args, req.identity.user.id); }
+          catch { result = { error: 'This tool is temporarily unavailable.' }; }
+          prompt.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result).slice(0, 12_000) });
+        }
+      } else done = true;
+    }
+    res.write('data: [DONE]\n\n'); res.end();
+    await writeUsage(req.identity.user.id, 'chat');
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    console.error('GROQGPT chat failed:', error.message);
+    if (!res.headersSent) sendError(res, 503, 'Chat service is temporarily unavailable.');
+    else if (!res.writableEnded) { res.write(`data: ${JSON.stringify({ error: 'Chat service is temporarily unavailable.' })}\n\n`); res.end('data: [DONE]\n\n'); }
+  }
+}
+
+async function summarizeTask(task) {
+  if (!process.env.GROQ_API_KEY) throw new Error('Chat service is unavailable.');
+  const response = await groqCompletion([{ role: 'system', content: 'Complete this scheduled task. Be concise and useful.' }, { role: 'user', content: task.prompt }], { maxTokens: 2048 });
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(json.error?.message || 'Task could not be completed.');
+  return json.choices?.[0]?.message?.content || 'No result.';
+}
+
+function nextTaskDate(date, cadence) {
+  const next = new Date(date);
+  if (cadence === 'once') return next.toISOString();
+  let attempts = 0;
+  do {
+    if (cadence === 'daily') next.setUTCDate(next.getUTCDate() + 1);
+    else if (cadence === 'weekly') next.setUTCDate(next.getUTCDate() + 7);
+    else if (cadence === 'monthly') next.setUTCMonth(next.getUTCMonth() + 1);
+    attempts++;
+  } while (next.getTime() <= Date.now() && attempts < 120);
+  return next.toISOString();
+}
+
+async function runSchedulerBatch() {
+  if (!supabase || !process.env.GROQ_API_KEY) return;
+  const { data: due, error } = await supabase.rpc('claim_due_ai_tasks', { batch_size: 10 });
+  if (error || !due?.length) return;
+  for (const task of due) {
+    try {
+      const result = await summarizeTask(task);
+      const recurring = task.cadence !== 'once';
+      await supabase.from('scheduled_tasks').update({ status: recurring ? 'scheduled' : 'completed', enabled: recurring, next_run_at: recurring ? nextTaskDate(task.next_run_at, task.cadence) : task.next_run_at, last_result: result, last_error: null, last_run_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', task.id);
+      await writeUsage(task.user_id, 'scheduled_task');
+    } catch (error) {
+      await supabase.from('scheduled_tasks').update({ status: 'failed', last_error: String(error.message).slice(0, 500), last_run_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', task.id);
+    }
+  }
+}
+
+async function cleanupGuests() {
+  if (!supabase) return;
+  const { data: guests } = await supabase.from('app_users').select('id').eq('is_guest', true).lt('expires_at', new Date().toISOString()).limit(100);
+  for (const guest of guests || []) {
+    const { data: files } = await supabase.from('library_files').select('object_key').eq('user_id', guest.id);
+    const { data: images } = await supabase.from('image_assets').select('object_key').eq('user_id', guest.id);
+    const keys = [...(files || []), ...(images || [])].map(x => x.object_key);
+    if (keys.length) await supabase.storage.from(STORAGE_BUCKET).remove(keys).catch(() => {});
+    await supabase.from('app_users').delete().eq('id', guest.id);
+  }
+  await supabase.from('app_sessions').delete().lt('expires_at', new Date().toISOString());
+}
+
+app.get('/api/status', async (_req, res) => {
+  res.json({ ready: Boolean(supabase && process.env.GROQ_API_KEY), model: MODEL, images: Boolean(process.env.IMAGE_API_KEY), webSearch: true, storage: Boolean(supabase) });
 });
 
-server.listen(PORT, () => console.log(`NEXORAGPT is ready at ${ORIGIN}`));
-process.on('SIGINT', () => { db.close(); server.close(() => process.exit(0)); });
-process.on('SIGTERM', () => { db.close(); server.close(() => process.exit(0)); });
+app.get('/api/session', guestLimiter, async (req, res) => {
+  try { const identity = await resolveIdentity(req, res, true); res.json({ user: publicUser(identity.user) }); }
+  catch (error) { sendError(res, 503, 'The hosted workspace is not connected yet.'); }
+});
+
+app.post('/api/auth/register', loginLimiter, requireUser, async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase(); const password = String(req.body?.password || '');
+  if (!/^\S+@\S+\.\S+$/.test(email) || password.length < 10 || password.length > 128) return sendError(res, 400, 'Use a valid email and a password with 10 to 128 characters.');
+  const { data, error } = await supabase.from('app_users').update({ email, password_hash: passwordHash(password), is_guest: false, expires_at: null }).eq('id', req.identity.user.id).select('id,email,display_name,role,is_guest').single();
+  if (error) return sendError(res, 409, 'That email may already have an account. Try signing in instead.');
+  res.json({ user: publicUser(data) });
+});
+
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
+  if (!supabase) return sendError(res, 503, 'Account service is temporarily unavailable.');
+  const email = String(req.body?.email || '').trim().toLowerCase(); const password = String(req.body?.password || '');
+  if (password.length > 128) return sendError(res, 401, 'Email or password is incorrect.');
+  const { data: user } = await supabase.from('app_users').select('id,email,password_hash,display_name,role,is_guest').eq('email', email).eq('is_guest', false).maybeSingle();
+  if (!user || !verifyPassword(password, user.password_hash)) return sendError(res, 401, 'Email or password is incorrect.');
+  const oldToken = cookieValue(req, cookieName); if (oldToken) await supabase.from('app_sessions').delete().eq('token_hash', sha(oldToken));
+  await createSession(res, { userId: user.id });
+  res.json({ user: publicUser(user) });
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  const token = cookieValue(req, cookieName); if (token && supabase) await supabase.from('app_sessions').delete().eq('token_hash', sha(token));
+  clearSessionCookie(res); res.json({ ok: true });
+});
+
+app.post('/api/admin/login', loginLimiter, async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase(); const password = String(req.body?.password || '');
+  const expectedEmail = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase(); const expectedPassword = String(process.env.ADMIN_PASSWORD || '');
+  const same = (a, b) => { const aa = Buffer.from(String(a)), bb = Buffer.from(String(b)); return aa.length === bb.length && timingSafeEqual(aa, bb); };
+  if (!supabase || !expectedEmail || !expectedPassword || !same(email, expectedEmail) || !same(password, expectedPassword)) return sendError(res, 401, 'Owner credentials were not accepted.');
+  const oldToken = cookieValue(req, cookieName); if (oldToken) await supabase.from('app_sessions').delete().eq('token_hash', sha(oldToken));
+  await createSession(res, { isAdmin: true }); res.json({ ok: true });
+});
+
+app.get('/api/workspace', requireUser, async (req, res) => {
+  try { res.json({ state: await getWorkspace(req.identity.user.id) }); }
+  catch { sendError(res, 503, 'Your private workspace is temporarily unavailable.'); }
+});
+
+app.put('/api/workspace', requireUser, async (req, res) => {
+  try {
+    const state = sanitizeWorkspace(req.body?.state);
+    const bytes = Buffer.byteLength(JSON.stringify(state));
+    if (bytes > 4_000_000) return sendError(res, 413, 'Workspace is too large. Remove older content or files.');
+    const { error } = await supabase.from('workspaces').upsert({ user_id: req.identity.user.id, state, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch { sendError(res, 503, 'Could not save your private workspace.'); }
+});
+
+app.patch('/api/profile', requireUser, async (req, res) => {
+  const displayName = cleanName(req.body?.displayName);
+  const { data, error } = await supabase.from('app_users').update({ display_name: displayName }).eq('id', req.identity.user.id).select('id,email,display_name,role,is_guest').single();
+  if (error) return sendError(res, 400, 'Could not update profile.');
+  res.json({ user: publicUser(data) });
+});
+
+app.post('/api/chat', aiLimiter, requireUser, chatHandler);
+app.post('/api/search', aiLimiter, requireUser, async (req, res) => {
+  const query = String(req.body?.query || '').trim();
+  if (!query || query.length > 1000) return sendError(res, 400, 'Enter a search phrase up to 1,000 characters.');
+  const result = await searchWeb(query);
+  if (result.error) return sendError(res, 503, 'Search is temporarily unavailable.');
+  await writeUsage(req.identity.user.id, 'web_search'); res.json(result);
+});
+app.post('/api/complete', aiLimiter, requireUser, async (req, res) => {
+  if (!isConfigured()) return sendError(res, 503, 'AI tools are temporarily unavailable.');
+  const prompt = String(req.body?.prompt || '').trim();
+  if (!prompt || prompt.length > 30_000) return sendError(res, 400, 'Text must be between 1 and 30,000 characters.');
+  try {
+    const response = await groqCompletion([{ role: 'system', content: 'Help with the user’s request. Be clear and concise.' }, { role: 'user', content: prompt }], { maxTokens: 2048 });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) return sendError(res, response.status, 'AI tools are temporarily unavailable.');
+    await writeUsage(req.identity.user.id, 'plugin'); res.json({ text: result.choices?.[0]?.message?.content || '' });
+  } catch { sendError(res, 503, 'AI tools are temporarily unavailable.'); }
+});
+
+app.get('/api/plugins/status', requireUser, (_req, res) => res.json({ plugins: {
+  calculator: { enabled: true, configured: true }, weather: { enabled: true, configured: true },
+  web_search: { enabled: true, configured: true },
+  translator: { enabled: true, configured: Boolean(process.env.GROQ_API_KEY) },
+  summarizer: { enabled: true, configured: Boolean(process.env.GROQ_API_KEY) },
+  pdf_reader: { enabled: true, configured: true }, file_analyzer: { enabled: true, configured: true },
+  image_generator: { enabled: true, configured: Boolean(process.env.IMAGE_API_KEY) }, calendar: { enabled: true, configured: true }
+} }));
+
+app.get('/api/community/assistants', async (_req, res) => {
+  if (!supabase) return res.json({ assistants: [] });
+  const { data } = await supabase.from('community_assistants').select('id,name,description,instructions,category,use_count,created_at').order('use_count', { ascending: false }).order('created_at', { ascending: false }).limit(100);
+  res.json({ assistants: data || [] });
+});
+app.post('/api/community/assistants', loginLimiter, requireUser, async (req, res) => {
+  if (req.identity.user.is_guest) return sendError(res, 403, 'Create an account before publishing an assistant.');
+  const name = cleanName(req.body?.name), instructions = String(req.body?.instructions || '').trim(), description = String(req.body?.description || '').trim().slice(0, 500), category = cleanName(req.body?.category || 'General').slice(0, 40);
+  if (!instructions || instructions.length > 6000) return sendError(res, 400, 'Assistant instructions must be between 1 and 6,000 characters.');
+  const { data, error } = await supabase.from('community_assistants').insert({ owner_id: req.identity.user.id, name, description: description || instructions.slice(0, 140), instructions, category }).select('id,name,description,instructions,category,use_count,created_at').single();
+  if (error) return sendError(res, 503, 'Could not publish this assistant.');
+  res.status(201).json({ assistant: data });
+});
+app.post('/api/community/assistants/:id/use', requireUser, async (req, res) => {
+  const { data: current } = await supabase.from('community_assistants').select('use_count').eq('id', req.params.id).maybeSingle();
+  if (!current) return sendError(res, 404, 'Assistant not found.');
+  const { error } = await supabase.from('community_assistants').update({ use_count: Number(current.use_count || 0) + 1 }).eq('id', req.params.id);
+  if (error) return sendError(res, 503, 'Could not open this assistant.');
+  res.json({ ok: true });
+});
+app.delete('/api/community/assistants/:id', requireUser, async (req, res) => {
+  const { data } = await supabase.from('community_assistants').delete().eq('id', req.params.id).eq('owner_id', req.identity.user.id).select('id').maybeSingle();
+  if (!data) return sendError(res, 404, 'Assistant not found.');
+  res.json({ ok: true });
+});
+
+app.get('/api/files', requireUser, async (req, res) => {
+  const { data, error } = await supabase.from('library_files').select('id,project_id,name,mime_type,file_size,created_at').eq('user_id', req.identity.user.id).order('created_at', { ascending: false }).limit(200);
+  if (error) return sendError(res, 503, 'Your library is temporarily unavailable.');
+  res.json({ files: data || [] });
+});
+
+app.post('/api/files', requireUser, async (req, res) => {
+  if (!supabase) return sendError(res, 503, 'File storage is unavailable.');
+  const name = cleanName(req.body?.name); const extension = name.split('.').pop().toLowerCase();
+  const allowedTypes = { pdf: 'application/pdf', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', txt: 'text/plain', csv: 'text/csv', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
+  if (!allowedTypes[extension]) return sendError(res, 415, 'Upload a PDF, DOCX, TXT, CSV, or common image file.');
+  const mime = allowedTypes[extension];
+  const base64 = String(req.body?.dataBase64 || '').replace(/^data:[^,]+,/, '');
+  if (!base64 || !/^[A-Za-z0-9+/=\r\n]+$/.test(base64)) return sendError(res, 400, 'The file could not be read.');
+  const bytes = Buffer.from(base64, 'base64');
+  if (bytes.length > MAX_FILE_BYTES) return sendError(res, 413, 'Files must be 10 MB or smaller.');
+  const extractedText = String(req.body?.extractedText || '').slice(0, 250_000);
+  const objectKey = `${req.identity.user.id}/${randomUUID()}/${name.replace(/[^A-Za-z0-9._-]/g, '_')}`;
+  try {
+    const stored = await supabase.storage.from(STORAGE_BUCKET).upload(objectKey, bytes, { contentType: mime, upsert: false });
+    if (stored.error) throw stored.error;
+    const { data, error } = await supabase.from('library_files').insert({ user_id: req.identity.user.id, project_id: req.body?.projectId || null, name, mime_type: mime, file_size: bytes.length, object_key: objectKey, extracted_text: extractedText }).select('id,project_id,name,mime_type,file_size,created_at').single();
+    if (error) { await supabase.storage.from(STORAGE_BUCKET).remove([objectKey]); throw error; }
+    await writeUsage(req.identity.user.id, 'file_upload'); res.status(201).json({ file: data });
+  } catch { sendError(res, 503, 'Could not save this file to your private library.'); }
+});
+
+app.get('/api/files/:id/download', requireUser, async (req, res) => {
+  const { data: file } = await supabase.from('library_files').select('object_key,name,mime_type').eq('id', req.params.id).eq('user_id', req.identity.user.id).maybeSingle();
+  if (!file) return sendError(res, 404, 'File not found.');
+  const { data, error } = await supabase.storage.from(STORAGE_BUCKET).download(file.object_key);
+  if (error) return sendError(res, 503, 'File download is temporarily unavailable.');
+  const bytes = Buffer.from(await data.arrayBuffer());
+  res.setHeader('Content-Type', file.mime_type);
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`);
+  res.setHeader('Cache-Control', 'private, no-store'); res.send(bytes);
+});
+
+app.delete('/api/files/:id', requireUser, async (req, res) => {
+  const { data: file } = await supabase.from('library_files').select('object_key').eq('id', req.params.id).eq('user_id', req.identity.user.id).maybeSingle();
+  if (!file) return sendError(res, 404, 'File not found.');
+  await supabase.storage.from(STORAGE_BUCKET).remove([file.object_key]);
+  await supabase.from('library_files').delete().eq('id', req.params.id).eq('user_id', req.identity.user.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/tasks', requireUser, async (req, res) => {
+  const title = cleanName(req.body?.title); const prompt = String(req.body?.prompt || '').trim();
+  const cadence = ['once', 'daily', 'weekly', 'monthly'].includes(req.body?.cadence) ? req.body.cadence : 'once';
+  const nextRun = new Date(req.body?.nextRunAt);
+  if (!prompt || prompt.length > 10_000 || !Number.isFinite(nextRun.getTime()) || nextRun.getTime() < Date.now() + 10_000) return sendError(res, 400, 'Add a task and choose a future run time.');
+  const existing = await supabase.from('scheduled_tasks').select('id', { count: 'exact', head: true }).eq('user_id', req.identity.user.id).in('status', ['scheduled', 'running']);
+  if (existing.error) return sendError(res, 503, 'Task scheduling is temporarily unavailable.');
+  if ((existing.count || 0) >= 20) return sendError(res, 429, 'You can have up to 20 active scheduled tasks.');
+  const { data, error } = await supabase.from('scheduled_tasks').insert({ user_id: req.identity.user.id, title, prompt, cadence, next_run_at: nextRun.toISOString() }).select('id,title,prompt,cadence,next_run_at,enabled,status,last_result,last_error,last_run_at,created_at').single();
+  if (error) return sendError(res, 503, 'Task scheduling is temporarily unavailable.');
+  res.status(201).json({ task: data });
+});
+
+app.get('/api/tasks', requireUser, async (req, res) => {
+  const { data, error } = await supabase.from('scheduled_tasks').select('id,title,prompt,cadence,next_run_at,enabled,status,last_result,last_error,last_run_at,created_at').eq('user_id', req.identity.user.id).order('created_at', { ascending: false }).limit(200);
+  if (error) return sendError(res, 503, 'Tasks are temporarily unavailable.');
+  res.json({ tasks: data || [] });
+});
+
+app.patch('/api/tasks/:id', requireUser, async (req, res) => {
+  const updates = {};
+  if (typeof req.body?.enabled === 'boolean') { updates.enabled = req.body.enabled; updates.status = req.body.enabled ? 'scheduled' : 'paused'; }
+  if (req.body?.title) updates.title = cleanName(req.body.title);
+  if (req.body?.prompt) updates.prompt = String(req.body.prompt).slice(0, 10_000);
+  const { data, error } = await supabase.from('scheduled_tasks').update({ ...updates, updated_at: new Date().toISOString() }).eq('id', req.params.id).eq('user_id', req.identity.user.id).select('id,title,prompt,cadence,next_run_at,enabled,status,last_result,last_error,last_run_at,created_at').maybeSingle();
+  if (error || !data) return sendError(res, 404, 'Task not found.');
+  res.json({ task: data });
+});
+
+app.delete('/api/tasks/:id', requireUser, async (req, res) => {
+  const { data } = await supabase.from('scheduled_tasks').delete().eq('id', req.params.id).eq('user_id', req.identity.user.id).select('id').maybeSingle();
+  if (!data) return sendError(res, 404, 'Task not found.');
+  res.json({ ok: true });
+});
+
+app.get('/api/images', requireUser, async (req, res) => {
+  const { data, error } = await supabase.from('image_assets').select('id,prompt,is_favorite,object_key,created_at').eq('user_id', req.identity.user.id).order('created_at', { ascending: false }).limit(100);
+  if (error) return sendError(res, 503, 'Image history is unavailable.');
+  const images = await Promise.all((data || []).map(async image => {
+    const signed = await supabase.storage.from(STORAGE_BUCKET).createSignedUrl(image.object_key, 3600);
+    return { id: image.id, prompt: image.prompt, favorite: image.is_favorite, created: image.created_at, url: signed.data?.signedUrl || '' };
+  }));
+  res.json({ images });
+});
+
+app.post('/api/image', aiLimiter, requireUser, async (req, res) => {
+  if (!process.env.IMAGE_API_KEY) return sendError(res, 503, 'Image generation is unavailable right now.');
+  const prompt = String(req.body?.prompt || '').trim();
+  if (!prompt || prompt.length > 4000) return sendError(res, 400, 'Image prompts must be 1 to 4,000 characters.');
+  const allowedSize = new Set(['1024x1024', '1024x1536', '1536x1024']);
+  const size = allowedSize.has(req.body.size) ? req.body.size : '1024x1024';
+  const model = process.env.IMAGE_MODEL || 'gpt-image-1'; const base = (process.env.IMAGE_API_BASE || 'https://api.openai.com/v1').replace(/\/+$/, '');
+  try {
+    let response;
+    if (req.body.imageData) {
+      const match = String(req.body.imageData).match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\r\n]+)$/);
+      if (!match) return sendError(res, 400, 'Choose a PNG, JPEG, or WebP image.');
+      const raw = Buffer.from(match[2], 'base64'); if (raw.length > 8_000_000) return sendError(res, 413, 'Edit images must be 8 MB or smaller.');
+      const form = new FormData(); form.append('model', model); form.append('prompt', prompt); form.append('size', size); form.append('image', new Blob([raw], { type: match[1] }), 'edit.jpeg');
+      response = await fetch(`${base}/images/edits`, { method: 'POST', headers: { Authorization: `Bearer ${process.env.IMAGE_API_KEY}` }, body: form, signal: AbortSignal.timeout(120_000) });
+    } else {
+      const quality = model.toLowerCase().startsWith('dall-e-3') ? (req.body.quality === 'hd' ? 'hd' : 'standard') : (req.body.quality === 'hd' ? 'high' : 'medium');
+      response = await fetch(`${base}/images/generations`, { method: 'POST', headers: { Authorization: `Bearer ${process.env.IMAGE_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model, prompt, n: 1, size, quality }), signal: AbortSignal.timeout(120_000) });
+    }
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) return sendError(res, response.status, 'Image generation is temporarily unavailable.');
+    const image = result.data?.[0]; let bytes;
+    if (image?.b64_json) bytes = Buffer.from(image.b64_json, 'base64');
+    else if (image?.url) { const download = await fetch(image.url, { signal: AbortSignal.timeout(60_000) }); if (!download.ok) throw new Error('Image download failed.'); bytes = Buffer.from(await download.arrayBuffer()); }
+    else return sendError(res, 502, 'Image provider returned no image.');
+    if (bytes.length > MAX_FILE_BYTES) return sendError(res, 413, 'Generated image is too large to store.');
+    const objectKey = `${req.identity.user.id}/images/${randomUUID()}.png`;
+    const stored = await supabase.storage.from(STORAGE_BUCKET).upload(objectKey, bytes, { contentType: 'image/png', upsert: false });
+    if (stored.error) throw stored.error;
+    const { data: asset, error } = await supabase.from('image_assets').insert({ user_id: req.identity.user.id, prompt, object_key: objectKey }).select('id,prompt,is_favorite,object_key,created_at').single();
+    if (error) { await supabase.storage.from(STORAGE_BUCKET).remove([objectKey]); throw error; }
+    const signed = await supabase.storage.from(STORAGE_BUCKET).createSignedUrl(objectKey, 3600);
+    await writeUsage(req.identity.user.id, 'image_generation');
+    res.json({ image: { id: asset.id, prompt, favorite: false, created: asset.created_at, url: signed.data?.signedUrl || '' } });
+  } catch (error) { console.error('Image generation failed:', error.message); sendError(res, 503, 'Image generation is temporarily unavailable.'); }
+});
+
+app.patch('/api/images/:id', requireUser, async (req, res) => {
+  const { data, error } = await supabase.from('image_assets').update({ is_favorite: Boolean(req.body?.favorite) }).eq('id', req.params.id).eq('user_id', req.identity.user.id).select('id').maybeSingle();
+  if (error || !data) return sendError(res, 404, 'Image not found.');
+  res.json({ ok: true });
+});
+
+app.delete('/api/images/:id', requireUser, async (req, res) => {
+  const { data } = await supabase.from('image_assets').delete().eq('id', req.params.id).eq('user_id', req.identity.user.id).select('object_key').maybeSingle();
+  if (!data) return sendError(res, 404, 'Image not found.');
+  await supabase.storage.from(STORAGE_BUCKET).remove([data.object_key]); res.json({ ok: true });
+});
+
+app.get('/api/calendar', requireUser, async (req, res) => {
+  const { data, error } = await supabase.from('calendar_events').select('id,title,description,starts_at,ends_at,created_at').eq('user_id', req.identity.user.id).order('starts_at').limit(200);
+  if (error) return sendError(res, 503, 'Calendar is temporarily unavailable.'); res.json({ events: data || [] });
+});
+app.post('/api/calendar', requireUser, async (req, res) => {
+  const title = cleanName(req.body?.title), startsAt = new Date(req.body?.startsAt), endsAt = new Date(req.body?.endsAt || req.body?.startsAt);
+  if (!Number.isFinite(startsAt.getTime()) || !Number.isFinite(endsAt.getTime())) return sendError(res, 400, 'Choose a valid date and time.');
+  const { data, error } = await supabase.from('calendar_events').insert({ user_id: req.identity.user.id, title, description: String(req.body?.description || '').slice(0, 2000), starts_at: startsAt.toISOString(), ends_at: endsAt.toISOString() }).select('id,title,description,starts_at,ends_at,created_at').single();
+  if (error) return sendError(res, 503, 'Could not save this event.'); res.status(201).json({ event: data });
+});
+app.delete('/api/calendar/:id', requireUser, async (req, res) => {
+  const { data } = await supabase.from('calendar_events').delete().eq('id', req.params.id).eq('user_id', req.identity.user.id).select('id').maybeSingle();
+  if (!data) return sendError(res, 404, 'Event not found.'); res.json({ ok: true });
+});
+
+app.get('/api/admin/stats', requireAdmin, async (_req, res) => {
+  const [users, guests, events, tasks, logs] = await Promise.all([
+    supabase.from('app_users').select('id', { count: 'exact', head: true }),
+    supabase.from('app_users').select('id', { count: 'exact', head: true }).eq('is_guest', true),
+    supabase.from('usage_events').select('id', { count: 'exact', head: true }).gte('created_at', new Date(Date.now() - 86_400_000).toISOString()),
+    supabase.from('scheduled_tasks').select('id,status,title,next_run_at').order('created_at', { ascending: false }).limit(50),
+    supabase.from('usage_events').select('id,event_type,model,created_at').order('created_at', { ascending: false }).limit(100)
+  ]);
+  res.json({ users: users.count || 0, guests: guests.count || 0, events24h: events.count || 0, tasks: tasks.data || [], logs: logs.data || [] });
+});
+
+app.get('/api/announcements', async (_req, res) => {
+  if (!supabase) return res.json({ announcements: [] });
+  const { data } = await supabase.from('announcements').select('id,title,message,created_at').eq('active', true).order('created_at', { ascending: false }).limit(5);
+  res.json({ announcements: data || [] });
+});
+app.post('/api/admin/announcements', requireAdmin, async (req, res) => {
+  const title = cleanName(req.body?.title), message = String(req.body?.message || '').trim().slice(0, 3000);
+  if (!message) return sendError(res, 400, 'Add an announcement message.');
+  const { data, error } = await supabase.from('announcements').insert({ title, message, active: true }).select('id,title,message,active,created_at').single();
+  if (error) return sendError(res, 503, 'Could not post the announcement.'); res.status(201).json({ announcement: data });
+});
+
+app.get('/api/tasks/notifications', requireUser, async (req, res) => {
+  const after = req.query.after ? new Date(req.query.after).toISOString() : new Date(Date.now() - 60_000).toISOString();
+  const { data } = await supabase.from('scheduled_tasks').select('id,title,status,last_result,last_error,last_run_at').eq('user_id', req.identity.user.id).gte('last_run_at', after).order('last_run_at', { ascending: false }).limit(20);
+  res.json({ notifications: data || [] });
+});
+
+app.get('/api/status/full', requireUser, async (_req, res) => {
+  const { data } = await supabase.from('announcements').select('id,title,message,created_at').eq('active', true).order('created_at', { ascending: false }).limit(5);
+  res.json({ model: MODEL, plugins: { webSearch: true, images: Boolean(process.env.IMAGE_API_KEY), calendar: true }, announcements: data || [] });
+});
+
+app.get('/api', (_req, res) => sendError(res, 404, 'Not found.'));
+app.get('/api/*path', (_req, res) => sendError(res, 404, 'Not found.'));
+
+for (const [route, file] of [['/', 'index.html'], ['/index.html', 'index.html'], ['/app.js', 'app.js'], ['/styles.css', 'styles.css']]) {
+  app.get(route, (_req, res) => res.sendFile(resolve(ROOT, file)));
+}
+app.get(/.*/, (_req, res) => res.sendFile(resolve(ROOT, 'index.html')));
+
+const port = Number(process.env.PORT || 3000);
+const host = process.env.HOST || (process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1');
+const server = app.listen(port, host, () => console.log(`GROQGPT web server listening on ${host}:${port} · ${supabase ? 'database configured' : 'database missing'} · ${process.env.GROQ_API_KEY ? 'AI provider configured' : 'AI provider missing'}`));
+server.requestTimeout = 120_000;
+let lastGuestCleanup = 0;
+setInterval(() => {
+  runSchedulerBatch().catch(error => console.error('Scheduler batch failed:', error.message));
+  if (Date.now() - lastGuestCleanup > 24 * 60 * 60 * 1000) {
+    lastGuestCleanup = Date.now();
+    cleanupGuests().catch(error => console.error('Guest cleanup failed:', error.message));
+  }
+}, 30_000).unref();

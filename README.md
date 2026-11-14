@@ -1,84 +1,53 @@
-# NEXORAGPT
+# GROQGPT
 
-A self-hosted AI chat and image workspace powered by [AI Horde](https://aihorde.net/). The project includes the browser app, a Node.js backend, a local SQLite database, account and session handling, real email verification, conversation history, image generation, file analysis, plugins, and a Windows setup flow.
-
-## Quick start on Windows
-
-1. Install **Node.js 22.13 or later** from [nodejs.org](https://nodejs.org/).
-2. Extract this ZIP to a folder you can write to.
-3. Double-click `setup.bat`. It installs the mail and document-reading packages and creates `.env` from `.env.example`.
-4. Open `.env` in Notepad and configure the settings below. Real account registration requires working SMTP settings.
-5. Double-click `start.bat`, then open [http://localhost:3000](http://localhost:3000).
-6. Create an account. NEXORAGPT sends a six-digit code to your email; enter it to verify the address.
-
-To stop the local server, press **Ctrl+C** in its console window. Start it again with `start.bat`.
-
-## Configuration
-
-### Required before registration: email delivery
-
-Set these fields in `.env` using your mail provider's SMTP settings:
-
-```dotenv
-SMTP_HOST=smtp.example.com
-SMTP_PORT=587
-SMTP_SECURE=false
-SMTP_USER=your-smtp-username
-SMTP_PASS=your-smtp-password
-SMTP_FROM=NEXORAGPT <no-reply@your-domain.example>
-```
-
-For port 465, set `SMTP_SECURE=true`. Many email providers require an app password or a verified sender address. Credentials stay in the backend `.env` file. Registration reports a failure if delivery fails; the app does not claim a code was sent.
-
-### AI Horde
-
-The default API key `0000000000` uses anonymous access. It is free to try, but anonymous work has lower priority, shared rate limits, and may wait longer or be rejected when the public queue is busy. An AI Horde account key can be set in `AI_HORDE_API_KEY` to use your own account. Free access does not mean unlimited capacity. Image generation depends on available volunteer workers and may take time.
-
-The chat API uses AI Horde's [OpenAI-compatible chat front](https://haidra-org.github.io/AI-Horde/how-to/send_chat_completions/). Image requests use the [AI Horde v2 asynchronous generation flow](https://github.com/Haidra-Org/AI-Horde/blob/main/README_integration.md). Available chat models are fetched from AI Horde and can be selected in Settings. To replace the chat endpoint with another OpenAI-compatible provider, set `AI_CHAT_BASE_URL` and `AI_CHAT_API_KEY`; image generation continues to use AI Horde.
-
-### Optional plugin: Translator
-
-Set `LIBRETRANSLATE_URL` to a LibreTranslate-compatible service URL. Set `LIBRETRANSLATE_API_KEY` if that service requires a key. The Translator plugin stays unavailable until configured.
-
-### Local deployment settings
-
-Change `SESSION_SECRET` to a unique long random string before exposing this server beyond your own computer. If changing `PORT`, also update `APP_ORIGIN` to the full URL and port. `DATA_DIR` is where the SQLite database and private uploads/generated images are stored.
+GROQGPT is a public, ChatGPT-style AI workspace powered by Groq’s **GPT OSS 120B** (openai/gpt-oss-120b). Visitors can start chatting as guests without creating an account or entering an API key. The site owner supplies the private service key once in the server host.
 
 ## What is included
 
-- **AI chat:** real AI Horde model responses, conversation context, saved chats, search, rename, delete, copy, retry/regenerate, model selection, loading states, and readable errors.
-- **Email accounts:** six-digit verification and reset codes expire after 10 minutes. Resend and login attempts are rate-limited. Passwords use scrypt hashing, and sessions are random HTTP-only cookies.
-- **Image studio:** submit real AI Horde image jobs in square, landscape, portrait, or wide dimensions, choose a prompt style, see queue status, save results locally, revisit history, and download completed images.
-- **File analysis:** attach images (up to 5 MB for AI Horde), PDF, Word `.docx`, text, Markdown, CSV, and JSON files (up to 8 MB). Text is extracted locally; text and images are sent to AI Horde when included in a chat request.
-- **Plugins:** calculator runs locally; Weather uses Open-Meteo; Web search uses DuckDuckGo Instant Answers; Summarizer uses AI Horde; Translator uses a configured LibreTranslate server. File and code helpers open the relevant built-in feature.
-- **Explore and settings:** category-filtered prompt starters, profile settings, appearance, available model selection, privacy information, password change, logout, and account deletion.
-- **Storage and privacy:** SQLite stores account data and conversations. Uploads and generated images are kept in per-account folders on this server. Account deletion removes the account's stored files and database records.
+- Responsive chat with streaming, stop, regenerate, edit, copy, read-aloud, and voice input.
+- Guest workspaces and optional email/password accounts.
+- Private projects, saved memory, conversations, file library, and image history.
+- Explore catalog with featured assistants, community assistant publishing, featured projects, models, and tools.
+- PDF, DOCX, TXT, CSV, and image file storage; text extraction is used for supported chat documents. The selected Groq chat model accepts text, not image input.
+- Calculator, web search, weather, translator, and summarizer tools.
+- Scheduled AI tasks, personal calendar, and an owner console for usage and announcements.
+- A separate optional image-generation provider. GROQGPT never claims Groq generated an image.
+- Server-side request limits and private provider credentials.
 
-## Privacy and limitations
+## Publish for anyone to use
 
-NEXORAGPT is self-hosted. It has no central sign-up service; you run the server and control its `.env` and `data` folder. The database and file folders contain private account data and should not be served or shared.
+This repository includes render.yaml for a Render web service that redeploys when you push changes to the connected GitHub branch.
 
-When you ask the AI a question, the conversation context and any attached file content are sent to AI Horde community workers. Image prompts are sent to AI Horde image workers. The calculator runs locally. Weather and Web search send the entered location/query to their named services. Do not submit passwords, API keys, or sensitive personal information to AI prompts.
+1. Create a Supabase project. Open its SQL Editor and run all of schema.sql once. This creates the private workspaces, account/session tables, task and calendar tables, usage records, and private file bucket.
+2. In Supabase, copy the project URL and create a server-side secret API key (sb_secret…). Keep it private.
+3. In the Groq Console, create a key with access to openai/gpt-oss-120b. Do not paste it into this repository or into the website.
+4. Push this folder to a GitHub repository. Confirm .env is not part of the commit; .gitignore excludes it.
+5. In Render, create a new Blueprint from that GitHub repository and follow the prompts for SUPABASE_URL, SUPABASE_SECRET_KEY, GROQ_API_KEY, ADMIN_EMAIL, and ADMIN_PASSWORD. Use a long, unique owner password.
+6. Wait for the service to deploy, then open its onrender.com address. Visitors can use the site right away as guests. The owner can sign in under Settings → Data & privacy → Owner sign in.
 
-Queue times, available models, rate limits, image quality, and whether any worker is available are controlled by AI Horde and can change. A generation may fail or remain queued. NEXORAGPT does not promise unlimited requests. This project has not been deployed as a public multi-tenant service; if you expose it publicly, configure HTTPS, a strong session secret, mail delivery, firewall rules, backups, and operational monitoring first.
+The Supabase secret key and Groq key belong only in Render’s private environment settings. A visitor never needs to see, copy, or configure either one. Render’s Blueprint flow supports prompting for secret values declared with sync: false; see the [Render Blueprint guide](https://render.com/docs/blueprint-spec).
 
-## Project layout
+### Optional providers
 
-```text
-server.js          Node.js server, API routes, SQLite, AI Horde integration
-public/            Browser interface, styles, icon
-data/              Created at runtime for the database, uploads, and images
-.env.example       Environment variable template
-setup.bat          Windows setup and dependency installation
-start.bat          Windows launch script
-```
+- **Images:** set IMAGE_API_KEY and, if needed, IMAGE_API_BASE and IMAGE_MODEL in Render. This must be a separate OpenAI-compatible image service. The Images page stays disabled until configured.
+- **Enhanced web search:** set TAVILY_API_KEY in Render. Without it, GROQGPT uses DuckDuckGo instant-answer results as a fallback.
 
-## Development checks
+## Local setup
 
-From this folder, run:
+Requires Node.js 20 or newer.
 
-```powershell
-npm run check
-```
+1. Copy .env.example to .env.
+2. Put your Supabase URL, Supabase server secret key, and Groq key in .env.
+3. Run npm install, then npm start, and open http://localhost:3000.
 
-The server stores its SQLite database at `data/nexoragpt.sqlite` by default. Back up the whole `data` folder to preserve conversation and image history.
+On Windows, start-groqgpt.bat can install the packages and open the local site. It will create a starter .env if one is missing; fill in the private values first.
+
+## Service and privacy notes
+
+- Every chat uses only openai/gpt-oss-120b; the model selector is intentionally fixed.
+- Guests receive a private workspace without signing in. Guest workspaces expire after 30 days. Creating an account saves that workspace for later sign-in.
+- Publishing an assistant to the public Explore catalog requires an account; guest-created assistants remain private to that workspace.
+- Uploaded files use private Supabase Storage and signed download links. Each file is limited to 10 MB.
+- The server allows up to 10 AI requests per IP per minute. Public visitors use the site owner’s Groq quota, so the owner should monitor usage in Groq and set provider limits appropriate to the deployment.
+- Scheduled tasks run from the server’s background loop. Hosting plans that suspend while idle can delay them; use an always-on service if tasks must run on time.
+- Never commit .env, paste service keys into browser code, or reuse an API key that appeared in a screenshot. Revoke exposed keys and create replacements.
